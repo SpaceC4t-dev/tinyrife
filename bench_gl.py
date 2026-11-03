@@ -24,8 +24,9 @@ for _ in range(args.n):
 ctx.finish(); t0 = time.perf_counter()
 for _ in range(args.n): g.run()
 ctx.finish(); wall = (time.perf_counter() - t0) / args.n * 1e3
+frames = [a, b]
 t0 = time.perf_counter()
-for _ in range(args.n): g(a, b)
+for i in range(args.n): g.push(frames[i % 2]); g.interpolate_bytes(0.5)  # streaming: 1 upload + 1 interp/frame
 e2e = (time.perf_counter() - t0) / args.n * 1e3
 gm = float(np.median(gpu))
 print(f"GL {w}x{h} (padded {g.W}x{g.H}) px={args.px} ot={args.ot} lx={args.lx} ly={args.ly}: "

@@ -25,15 +25,17 @@ pool = ThreadPoolExecutor(args.threads)
 pending = []
 gpu_s = 0.0
 t0 = time.perf_counter()
-nxt = pool.submit(load, src[0])
+AHEAD = 4  # decode a few frames ahead on the pool
+loads = [pool.submit(load, p) for p in src[:AHEAD + 1]]
+g.push(loads[0].result())
 for i in range(len(src) - 1):
-  a = nxt.result() if i == 0 else b
-  b_f = pool.submit(load, src[i + 1])
+  if i + AHEAD + 1 < len(src): loads.append(pool.submit(load, src[i + AHEAD + 1]))
   pending.append(pool.submit(shutil.copyfile, src[i], name(2 * i)))
-  b = b_f.result()
-  assert a.shape == b.shape, f"size mismatch at {src[i + 1]}"
+  b = loads[i + 1].result(); loads[i + 1] = None
+  assert b.shape == (h, w, 3), f"size mismatch at {src[i + 1]}"
   tg = time.perf_counter()
-  mid = g(a, b, 0.5)
+  g.push(b)                      # each frame is uploaded once and reused for the next pair
+  mid = g.interpolate(0.5)
   gpu_s += time.perf_counter() - tg
   pending.append(pool.submit(save, mid, 2 * i + 1))
   if (i + 1) % 50 == 0:

@@ -193,6 +193,42 @@ void main() {
 }
 """
 
+# tight RGB24 (IW x IH, as bytes in a uint SSBO) -> padded RGBA8 (W x H), zero outside the image
+UNPACK_SRC = """
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, binding = 0) readonly buffer Raw { uint raw[]; };
+layout(std430, binding = 3) writeonly buffer Out { uint outp[]; };
+uint byte_at(int i) { return (raw[i >> 2] >> uint((i & 3) * 8)) & 0xffu; }
+void main() {
+  int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+  if (x >= W || y >= H) return;
+  uint v = 0u;
+  if (x < IW && y < IH) {
+    int i = (y * IW + x) * 3;
+    v = byte_at(i) | (byte_at(i + 1) << 8) | (byte_at(i + 2) << 16);
+  }
+  outp[y * W + x] = v;
+}
+"""
+
+# padded RGBA8 (W x H) -> tight RGB24 (IW x IH); each thread packs 4 pixels into 3 uints (no byte-write races)
+PACK_SRC = """
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, binding = 3) writeonly buffer Dst { uint dst[]; };
+void main() {
+  int t = int(gl_GlobalInvocationID.x), p0 = t * 4, n = IW * IH;
+  if (p0 >= n) return;
+  uint b[12];
+  for (int k = 0; k < 4; k++) {
+    int p = p0 + k;
+    uint v = p < n ? src[(p / IW) * W + p % IW] : 0u;
+    b[3 * k] = v & 0xffu; b[3 * k + 1] = (v >> 8) & 0xffu; b[3 * k + 2] = (v >> 16) & 0xffu;
+  }
+  for (int j = 0; j < 3; j++) dst[t * 3 + j] = b[4 * j] | (b[4 * j + 1] << 8) | (b[4 * j + 2] << 16) | (b[4 * j + 3] << 24);
+}
+"""
+
 def cdiv(a, b): return (a + b - 1) // b
 
 # ---------------------------------------------------------------- weight packing
@@ -225,6 +261,11 @@ class GLRife:
     H, W, ctx = self.H, self.W, self.ctx
     buf = lambda nbytes: ctx.buffer(reserve=max(16, nbytes))
     self.img0, self.img1, self.out = buf(H * W * 4), buf(H * W * 4), buf(H * W * 4)
+    self.nbytes = h * w * 3
+    self.raw_in, self.raw_out = buf(cdiv(self.nbytes, 4) * 4), buf(cdiv(h * w, 4) * 12)
+    self._unpack = self._prog(UNPACK_SRC, IW=w, IH=h)
+    self._pack = self._prog(PACK_SRC, IW=w, IH=h)
+    self._prev, self._last, self._count = self.img0, self.img1, 0
     self.flow, self.mask = buf(H * W * 16), buf(H * W * 4)
     self.steps = []   # list of (program, {binding: buffer}, groups, uniforms)
     for bi, s in enumerate(SCALES):
@@ -278,13 +319,32 @@ class GLRife:
     groups = (cdiv(cdiv(wo, c["PX"]), c["LX"]), cdiv(ho, c["LY"]), oc4 // ot)
     return (p, {0: inp, 1: wt, 2: bs, 3: out}, groups, False)
 
-  def upload(self, a: np.ndarray, b: np.ndarray):
-    for img, dst in ((a, self.img0), (b, self.img1)):
-      rgba = np.zeros((self.H, self.W, 4), np.uint8)
-      rgba[:self.h, :self.w, :3] = img
-      dst.write(rgba.tobytes())
+  def push(self, frame):
+    """Upload the next frame (HxWx3 uint8 array or raw RGB24 bytes). Interpolation runs between the last two pushed."""
+    data = frame if isinstance(frame, (bytes, bytearray, memoryview)) else np.ascontiguousarray(frame, np.uint8)
+    assert len(memoryview(data).cast("B")) == self.nbytes, "frame size mismatch"
+    dst = self._prev                      # the older slot is free; it becomes the newest frame
+    self.raw_in.write(data)
+    self.raw_in.bind_to_storage_buffer(0); dst.bind_to_storage_buffer(3)
+    self._unpack.run(cdiv(self.W, 8), cdiv(self.H, 8), 1)
+    self.ctx.memory_barrier()
+    self._prev, self._last = self._last, dst
+    self._count += 1
+
+  def interpolate_bytes(self, timestep: float = 0.5) -> bytes:
+    """Frame at `timestep` between the last two pushed frames, as tight RGB24 bytes."""
+    assert self._count >= 2, "push two frames first"
+    self.run(timestep)
+    self.out.bind_to_storage_buffer(0); self.raw_out.bind_to_storage_buffer(3)
+    self._pack.run(cdiv(cdiv(self.h * self.w, 4), 64), 1, 1)
+    self.ctx.memory_barrier()
+    return self.raw_out.read(size=self.nbytes)
+
+  def interpolate(self, timestep: float = 0.5) -> np.ndarray:
+    return np.frombuffer(self.interpolate_bytes(timestep), np.uint8).reshape(self.h, self.w, 3)
 
   def run(self, timestep: float = 0.5):
+    self.shared[4], self.shared[5] = self._prev, self._last
     for prog, binds, groups, has_t in self.steps:
       for k, b in self.shared.items(): b.bind_to_storage_buffer(k)
       for k, b in binds.items(): b.bind_to_storage_buffer(k)
@@ -292,12 +352,8 @@ class GLRife:
       prog.run(*groups)
       self.ctx.memory_barrier()
 
-  def download(self) -> np.ndarray:
-    o = np.frombuffer(self.out.read(), np.uint8).reshape(self.H, self.W, 4)
-    return o[:self.h, :self.w, :3].copy()
-
   def __call__(self, a: np.ndarray, b: np.ndarray, timestep: float = 0.5) -> np.ndarray:
-    self.upload(a, b); self.run(timestep); return self.download()
+    self.push(a); self.push(b); return self.interpolate(timestep)
 
 if __name__ == "__main__":
   import argparse
