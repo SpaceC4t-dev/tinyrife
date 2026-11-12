@@ -402,6 +402,15 @@ static int graph_load_bin(Graph* g, const char* path) {
 
 /* =====================  HIGH-PERFORMANCE LAYER OPERATORS  ===================== */
 
+static inline __m256 apply_act(__m256 acc, int act_type, __m256 vslope, __m256 vzero) {
+    if (act_type == 2) {
+        return _mm256_blendv_ps(_mm256_mul_ps(acc, vslope), acc, _mm256_cmp_ps(acc, vzero, _CMP_GT_OQ));
+    } else if (act_type == 1) {
+        return _mm256_max_ps(acc, vzero);
+    }
+    return acc;
+}
+
 static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int in_w, int in_h, int in_c) {
     int W = in_w, H = in_h, C = in_c;
     int OW = out->w, OH = out->h, OC = out->c;
@@ -410,196 +419,392 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
     const float* B = L->bias;
     int act_type = L->act_type;
     float act_param = L->act_params[0];
+    __m256 vslope = _mm256_set1_ps(act_param);
+    __m256 vzero = _mm256_setzero_ps();
 
+    if (OW == 8) {
+        #pragma omp parallel for schedule(static)
+        for (int oc = 0; oc < OC - 3; oc += 4) {
+            int oc0 = oc, oc1 = oc + 1, oc2 = oc + 2, oc3 = oc + 3;
+            __m256 vbias0 = _mm256_set1_ps(B ? B[oc0] : 0.0f);
+            __m256 vbias1 = _mm256_set1_ps(B ? B[oc1] : 0.0f);
+            __m256 vbias2 = _mm256_set1_ps(B ? B[oc2] : 0.0f);
+            __m256 vbias3 = _mm256_set1_ps(B ? B[oc3] : 0.0f);
+
+            const float* wt0 = wt + (size_t)oc0 * C * 9;
+            const float* wt1 = wt + (size_t)oc1 * C * 9;
+            const float* wt2 = wt + (size_t)oc2 * C * 9;
+            const float* wt3 = wt + (size_t)oc3 * C * 9;
+
+            float* out0 = out->data + (size_t)oc0 * OH * OW;
+            float* out1 = out->data + (size_t)oc1 * OH * OW;
+            float* out2 = out->data + (size_t)oc2 * OH * OW;
+            float* out3 = out->data + (size_t)oc3 * OH * OW;
+
+            for (int oh = 0; oh < OH; oh++) {
+                __m256 a0 = vbias0, a1 = vbias1, a2 = vbias2, a3 = vbias3;
+                for (int c = 0; c < C; c++) {
+                    const float* pin_c = pin + (size_t)c * PH * PW;
+                    const float* r0 = pin_c + (oh + 0) * PW;
+                    const float* r1 = pin_c + (oh + 1) * PW;
+                    const float* r2 = pin_c + (oh + 2) * PW;
+                    const float* w0 = wt0 + c * 9;
+                    const float* w1 = wt1 + c * 9;
+                    const float* w2 = wt2 + c * 9;
+                    const float* w3 = wt3 + c * 9;
+
+                    #define FMA_4OC_1OW(rk, off, k) do { \
+                        __m256 kw0 = _mm256_set1_ps(w0[k]); \
+                        __m256 kw1 = _mm256_set1_ps(w1[k]); \
+                        __m256 kw2 = _mm256_set1_ps(w2[k]); \
+                        __m256 kw3 = _mm256_set1_ps(w3[k]); \
+                        __m256 in0 = _mm256_loadu_ps((rk) + (off)); \
+                        a0 = _mm256_fmadd_ps(in0, kw0, a0); \
+                        a1 = _mm256_fmadd_ps(in0, kw1, a1); \
+                        a2 = _mm256_fmadd_ps(in0, kw2, a2); \
+                        a3 = _mm256_fmadd_ps(in0, kw3, a3); \
+                    } while(0)
+
+                    FMA_4OC_1OW(r0, 0, 0); FMA_4OC_1OW(r0, 1, 1); FMA_4OC_1OW(r0, 2, 2);
+                    FMA_4OC_1OW(r1, 0, 3); FMA_4OC_1OW(r1, 1, 4); FMA_4OC_1OW(r1, 2, 5);
+                    FMA_4OC_1OW(r2, 0, 6); FMA_4OC_1OW(r2, 1, 7); FMA_4OC_1OW(r2, 2, 8);
+                    #undef FMA_4OC_1OW
+                }
+                a0 = apply_act(a0, act_type, vslope, vzero);
+                a1 = apply_act(a1, act_type, vslope, vzero);
+                a2 = apply_act(a2, act_type, vslope, vzero);
+                a3 = apply_act(a3, act_type, vslope, vzero);
+
+                _mm256_storeu_ps(out0 + oh * 8, a0);
+                _mm256_storeu_ps(out1 + oh * 8, a1);
+                _mm256_storeu_ps(out2 + oh * 8, a2);
+                _mm256_storeu_ps(out3 + oh * 8, a3);
+            }
+        }
+        return;
+    }
+
+    if (OW == 16) {
+        #pragma omp parallel for schedule(static)
+        for (int oc = 0; oc < OC - 3; oc += 4) {
+            int oc0 = oc, oc1 = oc + 1, oc2 = oc + 2, oc3 = oc + 3;
+            __m256 vbias0 = _mm256_set1_ps(B ? B[oc0] : 0.0f);
+            __m256 vbias1 = _mm256_set1_ps(B ? B[oc1] : 0.0f);
+            __m256 vbias2 = _mm256_set1_ps(B ? B[oc2] : 0.0f);
+            __m256 vbias3 = _mm256_set1_ps(B ? B[oc3] : 0.0f);
+
+            const float* wt0 = wt + (size_t)oc0 * C * 9;
+            const float* wt1 = wt + (size_t)oc1 * C * 9;
+            const float* wt2 = wt + (size_t)oc2 * C * 9;
+            const float* wt3 = wt + (size_t)oc3 * C * 9;
+
+            float* out0 = out->data + (size_t)oc0 * OH * OW;
+            float* out1 = out->data + (size_t)oc1 * OH * OW;
+            float* out2 = out->data + (size_t)oc2 * OH * OW;
+            float* out3 = out->data + (size_t)oc3 * OH * OW;
+
+            for (int oh = 0; oh < OH; oh++) {
+                __m256 a0_0 = vbias0, a1_0 = vbias0;
+                __m256 a0_1 = vbias1, a1_1 = vbias1;
+                __m256 a0_2 = vbias2, a1_2 = vbias2;
+                __m256 a0_3 = vbias3, a1_3 = vbias3;
+
+                for (int c = 0; c < C; c++) {
+                    const float* pin_c = pin + (size_t)c * PH * PW;
+                    const float* r0 = pin_c + (oh + 0) * PW;
+                    const float* r1 = pin_c + (oh + 1) * PW;
+                    const float* r2 = pin_c + (oh + 2) * PW;
+                    const float* w0 = wt0 + c * 9;
+                    const float* w1 = wt1 + c * 9;
+                    const float* w2 = wt2 + c * 9;
+                    const float* w3 = wt3 + c * 9;
+
+                    #define FMA_4OC_2OW(rk, off, k) do { \
+                        __m256 kw0 = _mm256_set1_ps(w0[k]); \
+                        __m256 kw1 = _mm256_set1_ps(w1[k]); \
+                        __m256 kw2 = _mm256_set1_ps(w2[k]); \
+                        __m256 kw3 = _mm256_set1_ps(w3[k]); \
+                        __m256 in0 = _mm256_loadu_ps((rk) + (off) + 0); \
+                        __m256 in1 = _mm256_loadu_ps((rk) + (off) + 8); \
+                        a0_0 = _mm256_fmadd_ps(in0, kw0, a0_0); \
+                        a1_0 = _mm256_fmadd_ps(in1, kw0, a1_0); \
+                        a0_1 = _mm256_fmadd_ps(in0, kw1, a0_1); \
+                        a1_1 = _mm256_fmadd_ps(in1, kw1, a1_1); \
+                        a0_2 = _mm256_fmadd_ps(in0, kw2, a0_2); \
+                        a1_2 = _mm256_fmadd_ps(in1, kw2, a1_2); \
+                        a0_3 = _mm256_fmadd_ps(in0, kw3, a0_3); \
+                        a1_3 = _mm256_fmadd_ps(in1, kw3, a1_3); \
+                    } while(0)
+
+                    FMA_4OC_2OW(r0, 0, 0); FMA_4OC_2OW(r0, 1, 1); FMA_4OC_2OW(r0, 2, 2);
+                    FMA_4OC_2OW(r1, 0, 3); FMA_4OC_2OW(r1, 1, 4); FMA_4OC_2OW(r1, 2, 5);
+                    FMA_4OC_2OW(r2, 0, 6); FMA_4OC_2OW(r2, 1, 7); FMA_4OC_2OW(r2, 2, 8);
+                    #undef FMA_4OC_2OW
+                }
+                a0_0 = apply_act(a0_0, act_type, vslope, vzero);
+                a1_0 = apply_act(a1_0, act_type, vslope, vzero);
+                a0_1 = apply_act(a0_1, act_type, vslope, vzero);
+                a1_1 = apply_act(a1_1, act_type, vslope, vzero);
+                a0_2 = apply_act(a0_2, act_type, vslope, vzero);
+                a1_2 = apply_act(a1_2, act_type, vslope, vzero);
+                a0_3 = apply_act(a0_3, act_type, vslope, vzero);
+                a1_3 = apply_act(a1_3, act_type, vslope, vzero);
+
+                _mm256_storeu_ps(out0 + oh * 16 + 0, a0_0); _mm256_storeu_ps(out0 + oh * 16 + 8, a1_0);
+                _mm256_storeu_ps(out1 + oh * 16 + 0, a0_1); _mm256_storeu_ps(out1 + oh * 16 + 8, a1_1);
+                _mm256_storeu_ps(out2 + oh * 16 + 0, a0_2); _mm256_storeu_ps(out2 + oh * 16 + 8, a1_2);
+                _mm256_storeu_ps(out3 + oh * 16 + 0, a0_3); _mm256_storeu_ps(out3 + oh * 16 + 8, a1_3);
+            }
+        }
+        return;
+    }
+
+    if (OW == 32) {
+        #pragma omp parallel for schedule(static)
+        for (int oc = 0; oc < OC - 2; oc += 3) {
+            int oc0 = oc, oc1 = oc + 1, oc2 = oc + 2;
+            __m256 vbias0 = _mm256_set1_ps(B ? B[oc0] : 0.0f);
+            __m256 vbias1 = _mm256_set1_ps(B ? B[oc1] : 0.0f);
+            __m256 vbias2 = _mm256_set1_ps(B ? B[oc2] : 0.0f);
+
+            const float* wt0 = wt + (size_t)oc0 * C * 9;
+            const float* wt1 = wt + (size_t)oc1 * C * 9;
+            const float* wt2 = wt + (size_t)oc2 * C * 9;
+
+            float* out0 = out->data + (size_t)oc0 * OH * OW;
+            float* out1 = out->data + (size_t)oc1 * OH * OW;
+            float* out2 = out->data + (size_t)oc2 * OH * OW;
+
+            for (int oh = 0; oh < OH; oh++) {
+                float* out_row0 = out0 + oh * OW;
+                float* out_row1 = out1 + oh * OW;
+                float* out_row2 = out2 + oh * OW;
+
+                __m256 a0_0 = vbias0, a1_0 = vbias0, a2_0 = vbias0, a3_0 = vbias0;
+                __m256 a0_1 = vbias1, a1_1 = vbias1, a2_1 = vbias1, a3_1 = vbias1;
+                __m256 a0_2 = vbias2, a1_2 = vbias2, a2_2 = vbias2, a3_2 = vbias2;
+
+                for (int c = 0; c < C; c++) {
+                    const float* pin_c = pin + (size_t)c * PH * PW;
+                    const float* r0 = pin_c + (oh + 0) * PW;
+                    const float* r1 = pin_c + (oh + 1) * PW;
+                    const float* r2 = pin_c + (oh + 2) * PW;
+                    const float* w0 = wt0 + c * 9;
+                    const float* w1 = wt1 + c * 9;
+                    const float* w2 = wt2 + c * 9;
+
+                    #define FMA_3OC_4OW(rk, off, kw_idx) do { \
+                        __m256 kw0 = _mm256_set1_ps(w0[kw_idx]); \
+                        __m256 kw1 = _mm256_set1_ps(w1[kw_idx]); \
+                        __m256 kw2 = _mm256_set1_ps(w2[kw_idx]); \
+                        __m256 in0 = _mm256_loadu_ps((rk) + (off) + 0); \
+                        a0_0 = _mm256_fmadd_ps(in0, kw0, a0_0); \
+                        a0_1 = _mm256_fmadd_ps(in0, kw1, a0_1); \
+                        a0_2 = _mm256_fmadd_ps(in0, kw2, a0_2); \
+                        __m256 in1 = _mm256_loadu_ps((rk) + (off) + 8); \
+                        a1_0 = _mm256_fmadd_ps(in1, kw0, a1_0); \
+                        a1_1 = _mm256_fmadd_ps(in1, kw1, a1_1); \
+                        a1_2 = _mm256_fmadd_ps(in1, kw2, a1_2); \
+                        __m256 in2 = _mm256_loadu_ps((rk) + (off) + 16); \
+                        a2_0 = _mm256_fmadd_ps(in2, kw0, a2_0); \
+                        a2_1 = _mm256_fmadd_ps(in2, kw1, a2_1); \
+                        a2_2 = _mm256_fmadd_ps(in2, kw2, a2_2); \
+                        __m256 in3 = _mm256_loadu_ps((rk) + (off) + 24); \
+                        a3_0 = _mm256_fmadd_ps(in3, kw0, a3_0); \
+                        a3_1 = _mm256_fmadd_ps(in3, kw1, a3_1); \
+                        a3_2 = _mm256_fmadd_ps(in3, kw2, a3_2); \
+                    } while(0)
+
+                    FMA_3OC_4OW(r0, 0, 0); FMA_3OC_4OW(r0, 1, 1); FMA_3OC_4OW(r0, 2, 2);
+                    FMA_3OC_4OW(r1, 0, 3); FMA_3OC_4OW(r1, 1, 4); FMA_3OC_4OW(r1, 2, 5);
+                    FMA_3OC_4OW(r2, 0, 6); FMA_3OC_4OW(r2, 1, 7); FMA_3OC_4OW(r2, 2, 8);
+                    #undef FMA_3OC_4OW
+                }
+
+                a0_0 = apply_act(a0_0, act_type, vslope, vzero);
+                a1_0 = apply_act(a1_0, act_type, vslope, vzero);
+                a2_0 = apply_act(a2_0, act_type, vslope, vzero);
+                a3_0 = apply_act(a3_0, act_type, vslope, vzero);
+                a0_1 = apply_act(a0_1, act_type, vslope, vzero);
+                a1_1 = apply_act(a1_1, act_type, vslope, vzero);
+                a2_1 = apply_act(a2_1, act_type, vslope, vzero);
+                a3_1 = apply_act(a3_1, act_type, vslope, vzero);
+                a0_2 = apply_act(a0_2, act_type, vslope, vzero);
+                a1_2 = apply_act(a1_2, act_type, vslope, vzero);
+                a2_2 = apply_act(a2_2, act_type, vslope, vzero);
+                a3_2 = apply_act(a3_2, act_type, vslope, vzero);
+
+                _mm256_storeu_ps(out_row0 + 0,  a0_0);
+                _mm256_storeu_ps(out_row0 + 8,  a1_0);
+                _mm256_storeu_ps(out_row0 + 16, a2_0);
+                _mm256_storeu_ps(out_row0 + 24, a3_0);
+
+                _mm256_storeu_ps(out_row1 + 0,  a0_1);
+                _mm256_storeu_ps(out_row1 + 8,  a1_1);
+                _mm256_storeu_ps(out_row1 + 16, a2_1);
+                _mm256_storeu_ps(out_row1 + 24, a3_1);
+
+                _mm256_storeu_ps(out_row2 + 0,  a0_2);
+                _mm256_storeu_ps(out_row2 + 8,  a1_2);
+                _mm256_storeu_ps(out_row2 + 16, a2_2);
+                _mm256_storeu_ps(out_row2 + 24, a3_2);
+            }
+        }
+        return;
+    }
+
+    if (OW == 64) {
+        #pragma omp parallel for schedule(static)
+        for (int oc = 0; oc < OC - 3; oc += 4) {
+            int oc0 = oc, oc1 = oc + 1, oc2 = oc + 2, oc3 = oc + 3;
+            __m256 vbias0 = _mm256_set1_ps(B ? B[oc0] : 0.0f);
+            __m256 vbias1 = _mm256_set1_ps(B ? B[oc1] : 0.0f);
+            __m256 vbias2 = _mm256_set1_ps(B ? B[oc2] : 0.0f);
+            __m256 vbias3 = _mm256_set1_ps(B ? B[oc3] : 0.0f);
+
+            const float* wt0 = wt + (size_t)oc0 * C * 9;
+            const float* wt1 = wt + (size_t)oc1 * C * 9;
+            const float* wt2 = wt + (size_t)oc2 * C * 9;
+            const float* wt3 = wt + (size_t)oc3 * C * 9;
+
+            float* out0 = out->data + (size_t)oc0 * OH * OW;
+            float* out1 = out->data + (size_t)oc1 * OH * OW;
+            float* out2 = out->data + (size_t)oc2 * OH * OW;
+            float* out3 = out->data + (size_t)oc3 * OH * OW;
+
+            for (int oh = 0; oh < OH; oh++) {
+                float* out_row0 = out0 + oh * OW;
+                float* out_row1 = out1 + oh * OW;
+                float* out_row2 = out2 + oh * OW;
+                float* out_row3 = out3 + oh * OW;
+
+                for (int ow = 0; ow + 16 <= OW; ow += 16) {
+                    __m256 a0_0 = vbias0, a1_0 = vbias0;
+                    __m256 a0_1 = vbias1, a1_1 = vbias1;
+                    __m256 a0_2 = vbias2, a1_2 = vbias2;
+                    __m256 a0_3 = vbias3, a1_3 = vbias3;
+
+                    for (int c = 0; c < C; c++) {
+                        const float* pin_c = pin + (size_t)c * PH * PW;
+                        const float* r0 = pin_c + (oh + 0) * PW + ow;
+                        const float* r1 = pin_c + (oh + 1) * PW + ow;
+                        const float* r2 = pin_c + (oh + 2) * PW + ow;
+                        const float* w0 = wt0 + c * 9;
+                        const float* w1 = wt1 + c * 9;
+                        const float* w2 = wt2 + c * 9;
+                        const float* w3 = wt3 + c * 9;
+
+                        #define FMA_4OC_2OW(rk, off, k) do { \
+                            __m256 kw0 = _mm256_set1_ps(w0[k]); \
+                            __m256 kw1 = _mm256_set1_ps(w1[k]); \
+                            __m256 kw2 = _mm256_set1_ps(w2[k]); \
+                            __m256 kw3 = _mm256_set1_ps(w3[k]); \
+                            __m256 in0 = _mm256_loadu_ps((rk) + (off) + 0); \
+                            __m256 in1 = _mm256_loadu_ps((rk) + (off) + 8); \
+                            a0_0 = _mm256_fmadd_ps(in0, kw0, a0_0); \
+                            a1_0 = _mm256_fmadd_ps(in1, kw0, a1_0); \
+                            a0_1 = _mm256_fmadd_ps(in0, kw1, a0_1); \
+                            a1_1 = _mm256_fmadd_ps(in1, kw1, a1_1); \
+                            a0_2 = _mm256_fmadd_ps(in0, kw2, a0_2); \
+                            a1_2 = _mm256_fmadd_ps(in1, kw2, a1_2); \
+                            a0_3 = _mm256_fmadd_ps(in0, kw3, a0_3); \
+                            a1_3 = _mm256_fmadd_ps(in1, kw3, a1_3); \
+                        } while(0)
+
+                        FMA_4OC_2OW(r0, 0, 0); FMA_4OC_2OW(r0, 1, 1); FMA_4OC_2OW(r0, 2, 2);
+                        FMA_4OC_2OW(r1, 0, 3); FMA_4OC_2OW(r1, 1, 4); FMA_4OC_2OW(r1, 2, 5);
+                        FMA_4OC_2OW(r2, 0, 6); FMA_4OC_2OW(r2, 1, 7); FMA_4OC_2OW(r2, 2, 8);
+                        #undef FMA_4OC_2OW
+                    }
+                    a0_0 = apply_act(a0_0, act_type, vslope, vzero);
+                    a1_0 = apply_act(a1_0, act_type, vslope, vzero);
+                    a0_1 = apply_act(a0_1, act_type, vslope, vzero);
+                    a1_1 = apply_act(a1_1, act_type, vslope, vzero);
+                    a0_2 = apply_act(a0_2, act_type, vslope, vzero);
+                    a1_2 = apply_act(a1_2, act_type, vslope, vzero);
+                    a0_3 = apply_act(a0_3, act_type, vslope, vzero);
+                    a1_3 = apply_act(a1_3, act_type, vslope, vzero);
+
+                    _mm256_storeu_ps(out_row0 + ow + 0, a0_0); _mm256_storeu_ps(out_row0 + ow + 8, a1_0);
+                    _mm256_storeu_ps(out_row1 + ow + 0, a0_1); _mm256_storeu_ps(out_row1 + ow + 8, a1_1);
+                    _mm256_storeu_ps(out_row2 + ow + 0, a0_2); _mm256_storeu_ps(out_row2 + ow + 8, a1_2);
+                    _mm256_storeu_ps(out_row3 + ow + 0, a0_3); _mm256_storeu_ps(out_row3 + ow + 8, a1_3);
+                }
+            }
+        }
+        return;
+    }
+
+    // Default fallback for any other OW
     #pragma omp parallel for schedule(static)
-    for (int oc = 0; oc < OC; oc++) {
-        __m256 vbias = _mm256_set1_ps(B ? B[oc] : 0.0f);
-        const float* wt_oc = wt + (size_t)oc * C * 9;
-        float* out_ch = out->data + (size_t)oc * OH * OW;
+    for (int oc = 0; oc < OC - 1; oc += 2) {
+        int oc0 = oc, oc1 = oc + 1;
+        __m256 vbias0 = _mm256_set1_ps(B ? B[oc0] : 0.0f);
+        __m256 vbias1 = _mm256_set1_ps(B ? B[oc1] : 0.0f);
+        const float* wt_oc0 = wt + (size_t)oc0 * C * 9;
+        const float* wt_oc1 = wt + (size_t)oc1 * C * 9;
+        float* out_ch0 = out->data + (size_t)oc0 * OH * OW;
+        float* out_ch1 = out->data + (size_t)oc1 * OH * OW;
+
         for (int oh = 0; oh < OH; oh++) {
-            float* out_row = out_ch + oh * OW;
+            float* out_row0 = out_ch0 + oh * OW;
+            float* out_row1 = out_ch1 + oh * OW;
             int ow = 0;
-            // 4-way unroll: 32 pixels per step
+
             for (; ow + 32 <= OW; ow += 32) {
-                __m256 acc0 = vbias, acc1 = vbias, acc2 = vbias, acc3 = vbias;
+                __m256 a0_0 = vbias0, a1_0 = vbias0, a2_0 = vbias0, a3_0 = vbias0;
+                __m256 a0_1 = vbias1, a1_1 = vbias1, a2_1 = vbias1, a3_1 = vbias1;
+
                 for (int c = 0; c < C; c++) {
                     const float* pin_c = pin + (size_t)c * PH * PW;
                     const float* r0 = pin_c + (oh + 0) * PW + ow;
                     const float* r1 = pin_c + (oh + 1) * PW + ow;
                     const float* r2 = pin_c + (oh + 2) * PW + ow;
-                    const float* w = wt_oc + c * 9;
+                    const float* w0 = wt_oc0 + c * 9;
+                    const float* w1 = wt_oc1 + c * 9;
 
-                    __m256 w0 = _mm256_set1_ps(w[0]);
-                    __m256 w1 = _mm256_set1_ps(w[1]);
-                    __m256 w2 = _mm256_set1_ps(w[2]);
-                    __m256 w3 = _mm256_set1_ps(w[3]);
-                    __m256 w4 = _mm256_set1_ps(w[4]);
-                    __m256 w5 = _mm256_set1_ps(w[5]);
-                    __m256 w6 = _mm256_set1_ps(w[6]);
-                    __m256 w7 = _mm256_set1_ps(w[7]);
-                    __m256 w8 = _mm256_set1_ps(w[8]);
+                    #define FMA_2OC_4OW(rk, off, kw_idx) do { \
+                        __m256 kw0 = _mm256_set1_ps(w0[kw_idx]); \
+                        __m256 kw1 = _mm256_set1_ps(w1[kw_idx]); \
+                        __m256 in0 = _mm256_loadu_ps((rk) + (off) + 0); \
+                        __m256 in1 = _mm256_loadu_ps((rk) + (off) + 8); \
+                        __m256 in2 = _mm256_loadu_ps((rk) + (off) + 16); \
+                        __m256 in3 = _mm256_loadu_ps((rk) + (off) + 24); \
+                        a0_0 = _mm256_fmadd_ps(in0, kw0, a0_0); \
+                        a0_1 = _mm256_fmadd_ps(in0, kw1, a0_1); \
+                        a1_0 = _mm256_fmadd_ps(in1, kw0, a1_0); \
+                        a1_1 = _mm256_fmadd_ps(in1, kw1, a1_1); \
+                        a2_0 = _mm256_fmadd_ps(in2, kw0, a2_0); \
+                        a2_1 = _mm256_fmadd_ps(in2, kw1, a2_1); \
+                        a3_0 = _mm256_fmadd_ps(in3, kw0, a3_0); \
+                        a3_1 = _mm256_fmadd_ps(in3, kw1, a3_1); \
+                    } while(0)
 
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 0), w0, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 8), w0, acc1);
-                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 16), w0, acc2);
-                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 24), w0, acc3);
-
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 1), w1, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 9), w1, acc1);
-                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 17), w1, acc2);
-                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 25), w1, acc3);
-
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 2), w2, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 10), w2, acc1);
-                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 18), w2, acc2);
-                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 26), w2, acc3);
-
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 0), w3, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 8), w3, acc1);
-                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 16), w3, acc2);
-                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 24), w3, acc3);
-
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 1), w4, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 9), w4, acc1);
-                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 17), w4, acc2);
-                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 25), w4, acc3);
-
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 2), w5, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 10), w5, acc1);
-                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 18), w5, acc2);
-                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 26), w5, acc3);
-
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 0), w6, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 8), w6, acc1);
-                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 16), w6, acc2);
-                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 24), w6, acc3);
-
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 1), w7, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 9), w7, acc1);
-                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 17), w7, acc2);
-                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 25), w7, acc3);
-
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 2), w8, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 10), w8, acc1);
-                    acc2 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 18), w8, acc2);
-                    acc3 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 26), w8, acc3);
+                    FMA_2OC_4OW(r0, 0, 0); FMA_2OC_4OW(r0, 1, 1); FMA_2OC_4OW(r0, 2, 2);
+                    FMA_2OC_4OW(r1, 0, 3); FMA_2OC_4OW(r1, 1, 4); FMA_2OC_4OW(r1, 2, 5);
+                    FMA_2OC_4OW(r2, 0, 6); FMA_2OC_4OW(r2, 1, 7); FMA_2OC_4OW(r2, 2, 8);
+                    #undef FMA_2OC_4OW
                 }
-                if (act_type == 2) {
-                    __m256 vslope = _mm256_set1_ps(act_param);
-                    __m256 vzero = _mm256_setzero_ps();
-                    acc0 = _mm256_blendv_ps(_mm256_mul_ps(acc0, vslope), acc0, _mm256_cmp_ps(acc0, vzero, _CMP_GT_OQ));
-                    acc1 = _mm256_blendv_ps(_mm256_mul_ps(acc1, vslope), acc1, _mm256_cmp_ps(acc1, vzero, _CMP_GT_OQ));
-                    acc2 = _mm256_blendv_ps(_mm256_mul_ps(acc2, vslope), acc2, _mm256_cmp_ps(acc2, vzero, _CMP_GT_OQ));
-                    acc3 = _mm256_blendv_ps(_mm256_mul_ps(acc3, vslope), acc3, _mm256_cmp_ps(acc3, vzero, _CMP_GT_OQ));
-                } else if (act_type == 1) {
-                    acc0 = _mm256_max_ps(acc0, _mm256_setzero_ps());
-                    acc1 = _mm256_max_ps(acc1, _mm256_setzero_ps());
-                    acc2 = _mm256_max_ps(acc2, _mm256_setzero_ps());
-                    acc3 = _mm256_max_ps(acc3, _mm256_setzero_ps());
-                }
-                _mm256_storeu_ps(out_row + ow + 0, acc0);
-                _mm256_storeu_ps(out_row + ow + 8, acc1);
-                _mm256_storeu_ps(out_row + ow + 16, acc2);
-                _mm256_storeu_ps(out_row + ow + 24, acc3);
-            }
-            // 2-way unroll: 16 pixels per step
-            for (; ow + 16 <= OW; ow += 16) {
-                __m256 acc0 = vbias, acc1 = vbias;
-                for (int c = 0; c < C; c++) {
-                    const float* pin_c = pin + (size_t)c * PH * PW;
-                    const float* r0 = pin_c + (oh + 0) * PW + ow;
-                    const float* r1 = pin_c + (oh + 1) * PW + ow;
-                    const float* r2 = pin_c + (oh + 2) * PW + ow;
-                    const float* w = wt_oc + c * 9;
 
-                    __m256 w0 = _mm256_set1_ps(w[0]);
-                    __m256 w1 = _mm256_set1_ps(w[1]);
-                    __m256 w2 = _mm256_set1_ps(w[2]);
-                    __m256 w3 = _mm256_set1_ps(w[3]);
-                    __m256 w4 = _mm256_set1_ps(w[4]);
-                    __m256 w5 = _mm256_set1_ps(w[5]);
-                    __m256 w6 = _mm256_set1_ps(w[6]);
-                    __m256 w7 = _mm256_set1_ps(w[7]);
-                    __m256 w8 = _mm256_set1_ps(w[8]);
+                a0_0 = apply_act(a0_0, act_type, vslope, vzero);
+                a1_0 = apply_act(a1_0, act_type, vslope, vzero);
+                a2_0 = apply_act(a2_0, act_type, vslope, vzero);
+                a3_0 = apply_act(a3_0, act_type, vslope, vzero);
 
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 0), w0, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 8), w0, acc1);
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 1), w1, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 9), w1, acc1);
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 2), w2, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 10), w2, acc1);
+                a0_1 = apply_act(a0_1, act_type, vslope, vzero);
+                a1_1 = apply_act(a1_1, act_type, vslope, vzero);
+                a2_1 = apply_act(a2_1, act_type, vslope, vzero);
+                a3_1 = apply_act(a3_1, act_type, vslope, vzero);
 
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 0), w3, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 8), w3, acc1);
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 1), w4, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 9), w4, acc1);
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 2), w5, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 10), w5, acc1);
+                _mm256_storeu_ps(out_row0 + ow + 0,  a0_0);
+                _mm256_storeu_ps(out_row0 + ow + 8,  a1_0);
+                _mm256_storeu_ps(out_row0 + ow + 16, a2_0);
+                _mm256_storeu_ps(out_row0 + ow + 24, a3_0);
 
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 0), w6, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 8), w6, acc1);
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 1), w7, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 9), w7, acc1);
-                    acc0 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 2), w8, acc0);
-                    acc1 = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 10), w8, acc1);
-                }
-                if (act_type == 2) {
-                    __m256 vslope = _mm256_set1_ps(act_param);
-                    __m256 vzero = _mm256_setzero_ps();
-                    acc0 = _mm256_blendv_ps(_mm256_mul_ps(acc0, vslope), acc0, _mm256_cmp_ps(acc0, vzero, _CMP_GT_OQ));
-                    acc1 = _mm256_blendv_ps(_mm256_mul_ps(acc1, vslope), acc1, _mm256_cmp_ps(acc1, vzero, _CMP_GT_OQ));
-                } else if (act_type == 1) {
-                    acc0 = _mm256_max_ps(acc0, _mm256_setzero_ps());
-                    acc1 = _mm256_max_ps(acc1, _mm256_setzero_ps());
-                }
-                _mm256_storeu_ps(out_row + ow + 0, acc0);
-                _mm256_storeu_ps(out_row + ow + 8, acc1);
-            }
-            // 1-way: 8 pixels per step
-            for (; ow + 8 <= OW; ow += 8) {
-                __m256 acc = vbias;
-                for (int c = 0; c < C; c++) {
-                    const float* pin_c = pin + (size_t)c * PH * PW;
-                    const float* r0 = pin_c + (oh + 0) * PW + ow;
-                    const float* r1 = pin_c + (oh + 1) * PW + ow;
-                    const float* r2 = pin_c + (oh + 2) * PW + ow;
-                    const float* w = wt_oc + c * 9;
-
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 0), _mm256_set1_ps(w[0]), acc);
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 1), _mm256_set1_ps(w[1]), acc);
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r0 + 2), _mm256_set1_ps(w[2]), acc);
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 0), _mm256_set1_ps(w[3]), acc);
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 1), _mm256_set1_ps(w[4]), acc);
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r1 + 2), _mm256_set1_ps(w[5]), acc);
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 0), _mm256_set1_ps(w[6]), acc);
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 1), _mm256_set1_ps(w[7]), acc);
-                    acc = _mm256_fmadd_ps(_mm256_loadu_ps(r2 + 2), _mm256_set1_ps(w[8]), acc);
-                }
-                if (act_type == 2) {
-                    __m256 vslope = _mm256_set1_ps(act_param);
-                    __m256 vzero = _mm256_setzero_ps();
-                    acc = _mm256_blendv_ps(_mm256_mul_ps(acc, vslope), acc, _mm256_cmp_ps(acc, vzero, _CMP_GT_OQ));
-                } else if (act_type == 1) {
-                    acc = _mm256_max_ps(acc, _mm256_setzero_ps());
-                }
-                _mm256_storeu_ps(out_row + ow, acc);
-            }
-            // Scalar tail
-            for (; ow < OW; ow++) {
-                float sum = B ? B[oc] : 0.0f;
-                for (int c = 0; c < C; c++) {
-                    const float* pin_c = pin + (size_t)c * PH * PW;
-                    const float* r0 = pin_c + (oh + 0) * PW + ow;
-                    const float* r1 = pin_c + (oh + 1) * PW + ow;
-                    const float* r2 = pin_c + (oh + 2) * PW + ow;
-                    const float* w = wt_oc + c * 9;
-                    sum += r0[0]*w[0] + r0[1]*w[1] + r0[2]*w[2]
-                         + r1[0]*w[3] + r1[1]*w[4] + r1[2]*w[5]
-                         + r2[0]*w[6] + r2[1]*w[7] + r2[2]*w[8];
-                }
-                if (act_type == 1) sum = fmaxf(sum, 0.0f);
-                else if (act_type == 2) sum = sum > 0.0f ? sum : sum * act_param;
-                out_row[ow] = sum;
+                _mm256_storeu_ps(out_row1 + ow + 0,  a0_1);
+                _mm256_storeu_ps(out_row1 + ow + 8,  a1_1);
+                _mm256_storeu_ps(out_row1 + ow + 16, a2_1);
+                _mm256_storeu_ps(out_row1 + ow + 24, a3_1);
             }
         }
     }
@@ -613,6 +818,8 @@ static void conv_s2_forward(const Layer* L, const float* pin, Tensor* out, int i
     const float* B = L->bias;
     int act_type = L->act_type;
     float act_param = L->act_params[0];
+    __m256 vslope = _mm256_set1_ps(act_param);
+    __m256 vzero = _mm256_setzero_ps();
 
     #pragma omp parallel for collapse(2) schedule(static)
     for (int oc_b = 0; oc_b < OC / 8; oc_b++) {
@@ -620,7 +827,71 @@ static void conv_s2_forward(const Layer* L, const float* pin, Tensor* out, int i
             __m256 vbias = B ? _mm256_loadu_ps(B + oc_b * 8) : _mm256_setzero_ps();
             int sy = oh * 2;
             const float* wt_block = wt_reord + (size_t)oc_b * C * 9 * 8;
-            for (int ow = 0; ow < OW; ow++) {
+            int ow = 0;
+
+            // 4-way unroll across OW: ow0, ow1, ow2, ow3
+            for (; ow + 4 <= OW; ow += 4) {
+                int sx0 = (ow + 0) * 2;
+                int sx1 = (ow + 1) * 2;
+                int sx2 = (ow + 2) * 2;
+                int sx3 = (ow + 3) * 2;
+
+                __m256 acc0 = vbias;
+                __m256 acc1 = vbias;
+                __m256 acc2 = vbias;
+                __m256 acc3 = vbias;
+
+                const float* w_ptr = wt_block;
+                for (int c = 0; c < C; c++) {
+                    const float* pin_c = pin + (size_t)c * PH * PW;
+                    const float* r0 = pin_c + (sy + 0) * PW;
+                    const float* r1 = pin_c + (sy + 1) * PW;
+                    const float* r2 = pin_c + (sy + 2) * PW;
+
+                    #define FMA_S2_4OW(r, k_off, w_off) do { \
+                        __m256 w_vec = _mm256_load_ps(w_ptr + (w_off)); \
+                        acc0 = _mm256_fmadd_ps(_mm256_set1_ps((r)[sx0 + (k_off)]), w_vec, acc0); \
+                        acc1 = _mm256_fmadd_ps(_mm256_set1_ps((r)[sx1 + (k_off)]), w_vec, acc1); \
+                        acc2 = _mm256_fmadd_ps(_mm256_set1_ps((r)[sx2 + (k_off)]), w_vec, acc2); \
+                        acc3 = _mm256_fmadd_ps(_mm256_set1_ps((r)[sx3 + (k_off)]), w_vec, acc3); \
+                    } while(0)
+
+                    FMA_S2_4OW(r0, 0, 0);
+                    FMA_S2_4OW(r0, 1, 8);
+                    FMA_S2_4OW(r0, 2, 16);
+                    FMA_S2_4OW(r1, 0, 24);
+                    FMA_S2_4OW(r1, 1, 32);
+                    FMA_S2_4OW(r1, 2, 40);
+                    FMA_S2_4OW(r2, 0, 48);
+                    FMA_S2_4OW(r2, 1, 56);
+                    FMA_S2_4OW(r2, 2, 64);
+                    #undef FMA_S2_4OW
+
+                    w_ptr += 72;
+                }
+
+                acc0 = apply_act(acc0, act_type, vslope, vzero);
+                acc1 = apply_act(acc1, act_type, vslope, vzero);
+                acc2 = apply_act(acc2, act_type, vslope, vzero);
+                acc3 = apply_act(acc3, act_type, vslope, vzero);
+
+                float tmp0[8], tmp1[8], tmp2[8], tmp3[8];
+                _mm256_storeu_ps(tmp0, acc0);
+                _mm256_storeu_ps(tmp1, acc1);
+                _mm256_storeu_ps(tmp2, acc2);
+                _mm256_storeu_ps(tmp3, acc3);
+
+                for (int s = 0; s < 8; s++) {
+                    size_t ch_off = (size_t)(oc_b * 8 + s) * OH * OW + oh * OW;
+                    out->data[ch_off + ow + 0] = tmp0[s];
+                    out->data[ch_off + ow + 1] = tmp1[s];
+                    out->data[ch_off + ow + 2] = tmp2[s];
+                    out->data[ch_off + ow + 3] = tmp3[s];
+                }
+            }
+
+            // Remainder for OW (if any)
+            for (; ow < OW; ow++) {
                 int sx = ow * 2;
                 __m256 acc = vbias;
                 const float* w_ptr = wt_block;
@@ -641,13 +912,7 @@ static void conv_s2_forward(const Layer* L, const float* pin, Tensor* out, int i
                     acc = _mm256_fmadd_ps(_mm256_set1_ps(r2[2]), _mm256_load_ps(w_ptr + 64), acc);
                     w_ptr += 72;
                 }
-                if (act_type == 2) {
-                    __m256 vslope = _mm256_set1_ps(act_param);
-                    __m256 mask = _mm256_cmp_ps(acc, _mm256_setzero_ps(), _CMP_GT_OQ);
-                    acc = _mm256_blendv_ps(_mm256_mul_ps(acc, vslope), acc, mask);
-                } else if (act_type == 1) {
-                    acc = _mm256_max_ps(acc, _mm256_setzero_ps());
-                }
+                acc = apply_act(acc, act_type, vslope, vzero);
                 float tmp[8];
                 _mm256_storeu_ps(tmp, acc);
                 for (int s = 0; s < 8; s++) {
@@ -706,10 +971,24 @@ static void deconv_forward(const Layer* L, const Tensor* in, Tensor* out) {
     int OW = out->w, OH = out->h;
     const float* wt_reord = L->weights;
     const float* B = L->bias;
+    float* in_hwc = g_pin_scratch;
 
+    // Pack in [C, H, W] to [H, W, C]
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int h = 0; h < H; h++) {
+        for (int w = 0; w < W; w++) {
+            float* dst = in_hwc + (h * W + w) * C;
+            for (int c = 0; c < C; c++) {
+                dst[c] = in->data[(size_t)c * H * W + h * W + w];
+            }
+        }
+    }
+
+    // Compute 2-way unrolled deconv from HWC buffer
     #pragma omp parallel for schedule(static)
     for (int oh = 0; oh < OH; oh++) {
         int kh_start = (oh + 1) & 1;
+        float row_buf[128 * 24];
         for (int ow = 0; ow < OW; ow++) {
             int kw_start = (ow + 1) & 1;
             __m256 sum0 = B ? _mm256_loadu_ps(B + 0) : _mm256_setzero_ps();
@@ -724,21 +1003,31 @@ static void deconv_forward(const Layer* L, const Tensor* in, Tensor* out) {
                     if ((unsigned)iw >= (unsigned)W) continue;
 
                     const float* wt_p = wt_reord + ((kh * 4 + kw) * C) * 24;
-                    for (int c = 0; c < C; c++) {
-                        __m256 vin = _mm256_set1_ps(in->data[(size_t)(c * H + ih) * W + iw]);
-                        sum0 = _mm256_fmadd_ps(vin, _mm256_load_ps(wt_p + 0),  sum0);
-                        sum1 = _mm256_fmadd_ps(vin, _mm256_load_ps(wt_p + 8),  sum1);
-                        sum2 = _mm256_fmadd_ps(vin, _mm256_load_ps(wt_p + 16), sum2);
-                        wt_p += 24;
+                    const float* in_ptr = in_hwc + (ih * W + iw) * C;
+                    for (int c = 0; c < C; c += 2) {
+                        __m256 v0 = _mm256_set1_ps(in_ptr[c + 0]);
+                        __m256 v1 = _mm256_set1_ps(in_ptr[c + 1]);
+
+                        sum0 = _mm256_fmadd_ps(v0, _mm256_load_ps(wt_p + 0),  sum0);
+                        sum1 = _mm256_fmadd_ps(v0, _mm256_load_ps(wt_p + 8),  sum1);
+                        sum2 = _mm256_fmadd_ps(v0, _mm256_load_ps(wt_p + 16), sum2);
+
+                        sum0 = _mm256_fmadd_ps(v1, _mm256_load_ps(wt_p + 24), sum0);
+                        sum1 = _mm256_fmadd_ps(v1, _mm256_load_ps(wt_p + 32), sum1);
+                        sum2 = _mm256_fmadd_ps(v1, _mm256_load_ps(wt_p + 40), sum2);
+
+                        wt_p += 48;
                     }
                 }
             }
-            float tmp[24];
-            _mm256_storeu_ps(tmp + 0,  sum0);
-            _mm256_storeu_ps(tmp + 8,  sum1);
-            _mm256_storeu_ps(tmp + 16, sum2);
-            for (int oc = 0; oc < 24; oc++) {
-                out->data[(size_t)oc * OH * OW + oh * OW + ow] = tmp[oc];
+            _mm256_storeu_ps(row_buf + ow * 24 + 0,  sum0);
+            _mm256_storeu_ps(row_buf + ow * 24 + 8,  sum1);
+            _mm256_storeu_ps(row_buf + ow * 24 + 16, sum2);
+        }
+        for (int oc = 0; oc < 24; oc++) {
+            float* dst = out->data + (size_t)oc * OH * OW + oh * OW;
+            for (int ow = 0; ow < OW; ow++) {
+                dst[ow] = row_buf[ow * 24 + oc];
             }
         }
     }
@@ -885,7 +1174,7 @@ static void binaryop_forward(const Layer* L, const Tensor* a, const Tensor* b, T
         int N = a->w * a->h * a->c;
         if (L->op_type == 7) {
             __m256 vs = _mm256_set1_ps(s);
-            #pragma omp parallel for if(N >= 16384) schedule(static)
+            #pragma omp parallel for if(N >= 65536) schedule(static)
             for (int i = 0; i <= N - 32; i += 32) {
                 _mm256_storeu_ps(out->data + i +  0, _mm256_sub_ps(vs, _mm256_loadu_ps(a->data + i +  0)));
                 _mm256_storeu_ps(out->data + i +  8, _mm256_sub_ps(vs, _mm256_loadu_ps(a->data + i +  8)));
@@ -896,7 +1185,7 @@ static void binaryop_forward(const Layer* L, const Tensor* a, const Tensor* b, T
             for (int i = start; i < N; i++) out->data[i] = s - a->data[i];
         } else if (L->op_type == 2) {
             __m256 vs = _mm256_set1_ps(s);
-            #pragma omp parallel for if(N >= 16384) schedule(static)
+            #pragma omp parallel for if(N >= 65536) schedule(static)
             for (int i = 0; i <= N - 32; i += 32) {
                 _mm256_storeu_ps(out->data + i +  0, _mm256_mul_ps(_mm256_loadu_ps(a->data + i +  0), vs));
                 _mm256_storeu_ps(out->data + i +  8, _mm256_mul_ps(_mm256_loadu_ps(a->data + i +  8), vs));
@@ -906,7 +1195,7 @@ static void binaryop_forward(const Layer* L, const Tensor* a, const Tensor* b, T
             int start = (N / 32) * 32;
             for (int i = start; i < N; i++) out->data[i] = a->data[i] * s;
         } else {
-            #pragma omp parallel for if(N >= 16384) schedule(static)
+            #pragma omp parallel for if(N >= 65536) schedule(static)
             for (int i = 0; i < N; i++) {
                 float av = a->data[i];
                 switch (L->op_type) {
@@ -923,7 +1212,7 @@ static void binaryop_forward(const Layer* L, const Tensor* a, const Tensor* b, T
         if (a->c == b->c) {
             int N = C * HW;
             if (L->op_type == 0) {
-                #pragma omp parallel for if(N >= 16384) schedule(static)
+                #pragma omp parallel for if(N >= 65536) schedule(static)
                 for (int i = 0; i <= N - 32; i += 32) {
                     _mm256_storeu_ps(out->data + i +  0, _mm256_add_ps(_mm256_loadu_ps(a->data + i +  0), _mm256_loadu_ps(b->data + i +  0)));
                     _mm256_storeu_ps(out->data + i +  8, _mm256_add_ps(_mm256_loadu_ps(a->data + i +  8), _mm256_loadu_ps(b->data + i +  8)));
@@ -933,7 +1222,7 @@ static void binaryop_forward(const Layer* L, const Tensor* a, const Tensor* b, T
                 int start = (N / 32) * 32;
                 for (int i = start; i < N; i++) out->data[i] = a->data[i] + b->data[i];
             } else if (L->op_type == 1) {
-                #pragma omp parallel for if(N >= 16384) schedule(static)
+                #pragma omp parallel for if(N >= 65536) schedule(static)
                 for (int i = 0; i <= N - 32; i += 32) {
                     _mm256_storeu_ps(out->data + i +  0, _mm256_sub_ps(_mm256_loadu_ps(a->data + i +  0), _mm256_loadu_ps(b->data + i +  0)));
                     _mm256_storeu_ps(out->data + i +  8, _mm256_sub_ps(_mm256_loadu_ps(a->data + i +  8), _mm256_loadu_ps(b->data + i +  8)));
@@ -943,7 +1232,7 @@ static void binaryop_forward(const Layer* L, const Tensor* a, const Tensor* b, T
                 int start = (N / 32) * 32;
                 for (int i = start; i < N; i++) out->data[i] = a->data[i] - b->data[i];
             } else if (L->op_type == 2) {
-                #pragma omp parallel for if(N >= 16384) schedule(static)
+                #pragma omp parallel for if(N >= 65536) schedule(static)
                 for (int i = 0; i <= N - 32; i += 32) {
                     _mm256_storeu_ps(out->data + i +  0, _mm256_mul_ps(_mm256_loadu_ps(a->data + i +  0), _mm256_loadu_ps(b->data + i +  0)));
                     _mm256_storeu_ps(out->data + i +  8, _mm256_mul_ps(_mm256_loadu_ps(a->data + i +  8), _mm256_loadu_ps(b->data + i +  8)));
@@ -998,12 +1287,24 @@ static void binaryop_forward(const Layer* L, const Tensor* a, const Tensor* b, T
 
 static void concat_forward(const Layer* L, const Tensor* blobs, Tensor* out) {
     int H = out->h, W = out->w;
-    size_t offset = 0;
+    int HW = H * W;
+    size_t out_ch = 0;
     for (int i = 0; i < L->in_count; i++) {
         const Tensor* in = &blobs[L->in_idx[i]];
-        size_t nbytes = (size_t)in->c * H * W * sizeof(float);
-        memcpy(out->data + offset, in->data, nbytes);
-        offset += (size_t)in->c * H * W;
+        int in_c = in->c;
+        const float* src = in->data;
+        float* dst = out->data + out_ch * HW;
+        size_t N = (size_t)in_c * HW;
+        #pragma omp parallel for if(N >= 65536) schedule(static)
+        for (size_t j = 0; j <= N - 32; j += 32) {
+            _mm256_storeu_ps(dst + j +  0, _mm256_loadu_ps(src + j +  0));
+            _mm256_storeu_ps(dst + j +  8, _mm256_loadu_ps(src + j +  8));
+            _mm256_storeu_ps(dst + j + 16, _mm256_loadu_ps(src + j + 16));
+            _mm256_storeu_ps(dst + j + 24, _mm256_loadu_ps(src + j + 24));
+        }
+        size_t start = (N / 32) * 32;
+        for (size_t j = start; j < N; j++) dst[j] = src[j];
+        out_ch += in_c;
     }
 }
 
@@ -1014,7 +1315,7 @@ static void eltwise_forward(const Layer* L, const Tensor* a, const Tensor* b, Te
     __m256 vc0 = _mm256_set1_ps(c0);
     __m256 vc1 = _mm256_set1_ps(c1);
 
-    #pragma omp parallel for if(N >= 16384) schedule(static)
+    #pragma omp parallel for if(N >= 65536) schedule(static)
     for (int i = 0; i <= N - 32; i += 32) {
         __m256 va0 = _mm256_loadu_ps(a->data + i +  0);
         __m256 va1 = _mm256_loadu_ps(a->data + i +  8);
@@ -1041,39 +1342,47 @@ static void warp_forward(const Tensor* img, const Tensor* flow, Tensor* out) {
     int C = img->c, H = img->h, W = img->w;
     const float* fxptr = flow->data;
     const float* fyptr = flow->data + (size_t)H * W;
+    size_t HW = (size_t)H * W;
 
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int c = 0; c < C; c++) {
-        for (int y = 0; y < H; y++) {
-            const float* in_ch = img->data + (size_t)c * H * W;
-            float* out_ch = out->data + (size_t)c * H * W;
-            const float* fx_row = fxptr + y * W;
-            const float* fy_row = fyptr + y * W;
-            for (int x = 0; x < W; x++) {
-                float sample_x = (float)x + fx_row[x];
-                float sample_y = (float)y + fy_row[x];
+    #pragma omp parallel for schedule(static)
+    for (int y = 0; y < H; y++) {
+        const float* fx_row = fxptr + y * W;
+        const float* fy_row = fyptr + y * W;
+        size_t row_dst = (size_t)y * W;
 
-                int x0 = (int)floorf(sample_x);
-                int y0 = (int)floorf(sample_y);
-                int x1 = x0 + 1;
-                int y1 = y0 + 1;
+        for (int x = 0; x < W; x++) {
+            float sample_x = (float)x + fx_row[x];
+            float sample_y = (float)y + fy_row[x];
 
-                if (x0 < 0) x0 = 0; else if (x0 > W - 1) x0 = W - 1;
-                if (y0 < 0) y0 = 0; else if (y0 > H - 1) y0 = H - 1;
-                if (x1 < 0) x1 = 0; else if (x1 > W - 1) x1 = W - 1;
-                if (y1 < 0) y1 = 0; else if (y1 > H - 1) y1 = H - 1;
+            int x0 = (int)floorf(sample_x);
+            int y0 = (int)floorf(sample_y);
+            int x1 = x0 + 1;
+            int y1 = y0 + 1;
 
-                float alpha = sample_x - (float)x0;
-                float beta  = sample_y - (float)y0;
+            if (x0 < 0) x0 = 0; else if (x0 > W - 1) x0 = W - 1;
+            if (y0 < 0) y0 = 0; else if (y0 > H - 1) y0 = H - 1;
+            if (x1 < 0) x1 = 0; else if (x1 > W - 1) x1 = W - 1;
+            if (y1 < 0) y1 = 0; else if (y1 > H - 1) y1 = H - 1;
 
-                float v0 = in_ch[y0 * W + x0];
-                float v1 = in_ch[y0 * W + x1];
-                float v2 = in_ch[y1 * W + x0];
-                float v3 = in_ch[y1 * W + x1];
+            float alpha = sample_x - (float)x0;
+            float beta  = sample_y - (float)y0;
+
+            size_t idx00 = (size_t)y0 * W + x0;
+            size_t idx01 = (size_t)y0 * W + x1;
+            size_t idx10 = (size_t)y1 * W + x0;
+            size_t idx11 = (size_t)y1 * W + x1;
+            size_t dst_idx = row_dst + x;
+
+            for (int c = 0; c < C; c++) {
+                const float* in_ch = img->data + (size_t)c * HW;
+                float v0 = in_ch[idx00];
+                float v1 = in_ch[idx01];
+                float v2 = in_ch[idx10];
+                float v3 = in_ch[idx11];
 
                 float v4 = v0 * (1.0f - alpha) + v1 * alpha;
                 float v5 = v2 * (1.0f - alpha) + v3 * alpha;
-                out_ch[y * W + x] = v4 * (1.0f - beta) + v5 * beta;
+                out->data[(size_t)c * HW + dst_idx] = v4 * (1.0f - beta) + v5 * beta;
             }
         }
     }
