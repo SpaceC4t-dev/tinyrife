@@ -31,9 +31,13 @@ typedef struct {
     int w, h, c;
     float* data;
     int is_alias;
+    int is_padded;
 } Tensor;
 
 static inline size_t tensor_bytes(const Tensor* t) {
+    if (t->is_padded) {
+        return (size_t)t->c * (t->h + 2) * (t->w + 2) * sizeof(float);
+    }
     return (size_t)t->w * t->h * t->c * sizeof(float);
 }
 
@@ -41,7 +45,21 @@ static Tensor tensor_make(int w, int h, int c) {
     Tensor t;
     t.w = w; t.h = h; t.c = c;
     t.is_alias = 0;
+    t.is_padded = 0;
     size_t sz = (size_t)w * h * c * sizeof(float);
+    size_t alloc_sz = (sz + 63) & ~63;
+    t.data = (float*)aligned_alloc(64, alloc_sz ? alloc_sz : 64);
+    assert(t.data != NULL);
+    memset(t.data, 0, sz);
+    return t;
+}
+
+static Tensor tensor_make_padded(int w, int h, int c) {
+    Tensor t;
+    t.w = w; t.h = h; t.c = c;
+    t.is_alias = 0;
+    t.is_padded = 1;
+    size_t sz = (size_t)c * (h + 2) * (w + 2) * sizeof(float);
     size_t alloc_sz = (sz + 63) & ~63;
     t.data = (float*)aligned_alloc(64, alloc_sz ? alloc_sz : 64);
     assert(t.data != NULL);
@@ -59,7 +77,8 @@ static void tensor_free(Tensor* t) {
 /* Persistent padding workspace for all convolutions */
 #define PIN_SCRATCH_SIZE (8 * 1024 * 1024)
 static float* g_pin_scratch = NULL;
-double s1_time = 0, s2_time = 0;
+double s1_time = 0, s2_time = 0, pad_time = 0;
+double s1_8_time = 0, s1_16_time = 0, s1_32_time = 0, s1_64_time = 0;
 
 /* =====================  GRAPH & LAYER DEFINITIONS  ===================== */
 
@@ -80,7 +99,8 @@ typedef enum {
     LT_CROP,
     LT_WARP,
     LT_ELTWISE,
-    LT_SIGMOID
+    LT_SIGMOID,
+    LT_NOP
 } LayerType;
 
 typedef struct {
@@ -88,6 +108,7 @@ typedef struct {
     char name[MAX_NAME];
     int in_count, out_count;
     int in_idx[8], out_idx[8];
+    int res_blob_idx; /* For fused ResBlock (conv + res_add + leakyrelu) */
 
     /* Conv / Deconv */
     int num_output, kernel, stride, pad, dilation, bias_term;
@@ -198,6 +219,7 @@ static int parse_param_line(Graph* g, char* line) {
     L->scale_w = 1.0f;
     L->scale_h = 1.0f;
     L->upscale = 1;
+    L->res_blob_idx = -1;
 
     while (tok_idx < ntokens) {
         char* token = tokens[tok_idx++];
@@ -411,7 +433,9 @@ static inline __m256 apply_act(__m256 acc, int act_type, __m256 vslope, __m256 v
     return acc;
 }
 
-static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int in_w, int in_h, int in_c) {
+static void conv_s1_forward(const Layer* L, const float* pin, const Tensor* res, Tensor* out, int in_w, int in_h, int in_c) {
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     int W = in_w, H = in_h, C = in_c;
     int OW = out->w, OH = out->h, OC = out->c;
     int PW = W + 2, PH = H + 2;
@@ -421,6 +445,14 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
     float act_param = L->act_params[0];
     __m256 vslope = _mm256_set1_ps(act_param);
     __m256 vzero = _mm256_setzero_ps();
+
+    int out_pw = out->is_padded ? (OW + 2) : OW;
+    size_t out_ch_sz = (size_t)out_pw * (out->is_padded ? (OH + 2) : OH);
+    int out_col_base = out->is_padded ? 1 : 0;
+
+    int res_pw = (res && res->is_padded) ? (OW + 2) : OW;
+    size_t res_ch_sz = (res && res->is_padded) ? (size_t)res_pw * (OH + 2) : (size_t)OW * OH;
+    int res_col_base = (res && res->is_padded) ? 1 : 0;
 
     if (OW == 8) {
         #pragma omp parallel for schedule(static)
@@ -436,12 +468,19 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
             const float* wt2 = wt + (size_t)oc2 * C * 9;
             const float* wt3 = wt + (size_t)oc3 * C * 9;
 
-            float* out0 = out->data + (size_t)oc0 * OH * OW;
-            float* out1 = out->data + (size_t)oc1 * OH * OW;
-            float* out2 = out->data + (size_t)oc2 * OH * OW;
-            float* out3 = out->data + (size_t)oc3 * OH * OW;
+            float* out0 = out->data + (size_t)oc0 * out_ch_sz;
+            float* out1 = out->data + (size_t)oc1 * out_ch_sz;
+            float* out2 = out->data + (size_t)oc2 * out_ch_sz;
+            float* out3 = out->data + (size_t)oc3 * out_ch_sz;
+            const float* res0 = res ? res->data + (size_t)oc0 * res_ch_sz : NULL;
+            const float* res1 = res ? res->data + (size_t)oc1 * res_ch_sz : NULL;
+            const float* res2 = res ? res->data + (size_t)oc2 * res_ch_sz : NULL;
+            const float* res3 = res ? res->data + (size_t)oc3 * res_ch_sz : NULL;
 
             for (int oh = 0; oh < OH; oh++) {
+                size_t out_row_off = (size_t)(out->is_padded ? (oh + 1) : oh) * out_pw + out_col_base;
+                size_t res_row_off = (size_t)((res && res->is_padded) ? (oh + 1) : oh) * res_pw + res_col_base;
+
                 __m256 a0 = vbias0, a1 = vbias1, a2 = vbias2, a3 = vbias3;
                 for (int c = 0; c < C; c++) {
                     const float* pin_c = pin + (size_t)c * PH * PW;
@@ -470,17 +509,25 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
                     FMA_4OC_1OW(r2, 0, 6); FMA_4OC_1OW(r2, 1, 7); FMA_4OC_1OW(r2, 2, 8);
                     #undef FMA_4OC_1OW
                 }
+                if (res) {
+                    a0 = _mm256_add_ps(a0, _mm256_loadu_ps(res0 + res_row_off));
+                    a1 = _mm256_add_ps(a1, _mm256_loadu_ps(res1 + res_row_off));
+                    a2 = _mm256_add_ps(a2, _mm256_loadu_ps(res2 + res_row_off));
+                    a3 = _mm256_add_ps(a3, _mm256_loadu_ps(res3 + res_row_off));
+                }
                 a0 = apply_act(a0, act_type, vslope, vzero);
                 a1 = apply_act(a1, act_type, vslope, vzero);
                 a2 = apply_act(a2, act_type, vslope, vzero);
                 a3 = apply_act(a3, act_type, vslope, vzero);
 
-                _mm256_storeu_ps(out0 + oh * 8, a0);
-                _mm256_storeu_ps(out1 + oh * 8, a1);
-                _mm256_storeu_ps(out2 + oh * 8, a2);
-                _mm256_storeu_ps(out3 + oh * 8, a3);
+                _mm256_storeu_ps(out0 + out_row_off, a0);
+                _mm256_storeu_ps(out1 + out_row_off, a1);
+                _mm256_storeu_ps(out2 + out_row_off, a2);
+                _mm256_storeu_ps(out3 + out_row_off, a3);
             }
         }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        s1_8_time += (t1.tv_sec - t0.tv_sec)*1000.0 + (t1.tv_nsec - t0.tv_nsec)*1e-6;
         return;
     }
 
@@ -498,12 +545,19 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
             const float* wt2 = wt + (size_t)oc2 * C * 9;
             const float* wt3 = wt + (size_t)oc3 * C * 9;
 
-            float* out0 = out->data + (size_t)oc0 * OH * OW;
-            float* out1 = out->data + (size_t)oc1 * OH * OW;
-            float* out2 = out->data + (size_t)oc2 * OH * OW;
-            float* out3 = out->data + (size_t)oc3 * OH * OW;
+            float* out0 = out->data + (size_t)oc0 * out_ch_sz;
+            float* out1 = out->data + (size_t)oc1 * out_ch_sz;
+            float* out2 = out->data + (size_t)oc2 * out_ch_sz;
+            float* out3 = out->data + (size_t)oc3 * out_ch_sz;
+            const float* res0 = res ? res->data + (size_t)oc0 * res_ch_sz : NULL;
+            const float* res1 = res ? res->data + (size_t)oc1 * res_ch_sz : NULL;
+            const float* res2 = res ? res->data + (size_t)oc2 * res_ch_sz : NULL;
+            const float* res3 = res ? res->data + (size_t)oc3 * res_ch_sz : NULL;
 
             for (int oh = 0; oh < OH; oh++) {
+                size_t out_row_off = (size_t)(out->is_padded ? (oh + 1) : oh) * out_pw + out_col_base;
+                size_t res_row_off = (size_t)((res && res->is_padded) ? (oh + 1) : oh) * res_pw + res_col_base;
+
                 __m256 a0_0 = vbias0, a1_0 = vbias0;
                 __m256 a0_1 = vbias1, a1_1 = vbias1;
                 __m256 a0_2 = vbias2, a1_2 = vbias2;
@@ -541,6 +595,17 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
                     FMA_4OC_2OW(r2, 0, 6); FMA_4OC_2OW(r2, 1, 7); FMA_4OC_2OW(r2, 2, 8);
                     #undef FMA_4OC_2OW
                 }
+                if (res) {
+                    a0_0 = _mm256_add_ps(a0_0, _mm256_loadu_ps(res0 + res_row_off + 0));
+                    a1_0 = _mm256_add_ps(a1_0, _mm256_loadu_ps(res0 + res_row_off + 8));
+                    a0_1 = _mm256_add_ps(a0_1, _mm256_loadu_ps(res1 + res_row_off + 0));
+                    a1_1 = _mm256_add_ps(a1_1, _mm256_loadu_ps(res1 + res_row_off + 8));
+                    a0_2 = _mm256_add_ps(a0_2, _mm256_loadu_ps(res2 + res_row_off + 0));
+                    a1_2 = _mm256_add_ps(a1_2, _mm256_loadu_ps(res2 + res_row_off + 8));
+                    a0_3 = _mm256_add_ps(a0_3, _mm256_loadu_ps(res3 + res_row_off + 0));
+                    a1_3 = _mm256_add_ps(a1_3, _mm256_loadu_ps(res3 + res_row_off + 8));
+                }
+
                 a0_0 = apply_act(a0_0, act_type, vslope, vzero);
                 a1_0 = apply_act(a1_0, act_type, vslope, vzero);
                 a0_1 = apply_act(a0_1, act_type, vslope, vzero);
@@ -550,12 +615,14 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
                 a0_3 = apply_act(a0_3, act_type, vslope, vzero);
                 a1_3 = apply_act(a1_3, act_type, vslope, vzero);
 
-                _mm256_storeu_ps(out0 + oh * 16 + 0, a0_0); _mm256_storeu_ps(out0 + oh * 16 + 8, a1_0);
-                _mm256_storeu_ps(out1 + oh * 16 + 0, a0_1); _mm256_storeu_ps(out1 + oh * 16 + 8, a1_1);
-                _mm256_storeu_ps(out2 + oh * 16 + 0, a0_2); _mm256_storeu_ps(out2 + oh * 16 + 8, a1_2);
-                _mm256_storeu_ps(out3 + oh * 16 + 0, a0_3); _mm256_storeu_ps(out3 + oh * 16 + 8, a1_3);
+                _mm256_storeu_ps(out0 + out_row_off + 0, a0_0); _mm256_storeu_ps(out0 + out_row_off + 8, a1_0);
+                _mm256_storeu_ps(out1 + out_row_off + 0, a0_1); _mm256_storeu_ps(out1 + out_row_off + 8, a1_1);
+                _mm256_storeu_ps(out2 + out_row_off + 0, a0_2); _mm256_storeu_ps(out2 + out_row_off + 8, a1_2);
+                _mm256_storeu_ps(out3 + out_row_off + 0, a0_3); _mm256_storeu_ps(out3 + out_row_off + 8, a1_3);
             }
         }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        s1_16_time += (t1.tv_sec - t0.tv_sec)*1000.0 + (t1.tv_nsec - t0.tv_nsec)*1e-6;
         return;
     }
 
@@ -571,14 +638,19 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
             const float* wt1 = wt + (size_t)oc1 * C * 9;
             const float* wt2 = wt + (size_t)oc2 * C * 9;
 
-            float* out0 = out->data + (size_t)oc0 * OH * OW;
-            float* out1 = out->data + (size_t)oc1 * OH * OW;
-            float* out2 = out->data + (size_t)oc2 * OH * OW;
+            float* out0 = out->data + (size_t)oc0 * out_ch_sz;
+            float* out1 = out->data + (size_t)oc1 * out_ch_sz;
+            float* out2 = out->data + (size_t)oc2 * out_ch_sz;
+            const float* res0 = res ? res->data + (size_t)oc0 * res_ch_sz : NULL;
+            const float* res1 = res ? res->data + (size_t)oc1 * res_ch_sz : NULL;
+            const float* res2 = res ? res->data + (size_t)oc2 * res_ch_sz : NULL;
 
             for (int oh = 0; oh < OH; oh++) {
-                float* out_row0 = out0 + oh * OW;
-                float* out_row1 = out1 + oh * OW;
-                float* out_row2 = out2 + oh * OW;
+                size_t out_row_off = (size_t)(out->is_padded ? (oh + 1) : oh) * out_pw + out_col_base;
+                size_t res_row_off = (size_t)((res && res->is_padded) ? (oh + 1) : oh) * res_pw + res_col_base;
+                float* out_row0 = out0 + out_row_off;
+                float* out_row1 = out1 + out_row_off;
+                float* out_row2 = out2 + out_row_off;
 
                 __m256 a0_0 = vbias0, a1_0 = vbias0, a2_0 = vbias0, a3_0 = vbias0;
                 __m256 a0_1 = vbias1, a1_1 = vbias1, a2_1 = vbias1, a3_1 = vbias1;
@@ -621,6 +693,26 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
                     #undef FMA_3OC_4OW
                 }
 
+                if (res) {
+                    const float* r0 = res0 + res_row_off;
+                    const float* r1 = res1 + res_row_off;
+                    const float* r2 = res2 + res_row_off;
+                    a0_0 = _mm256_add_ps(a0_0, _mm256_loadu_ps(r0 + 0));
+                    a1_0 = _mm256_add_ps(a1_0, _mm256_loadu_ps(r0 + 8));
+                    a2_0 = _mm256_add_ps(a2_0, _mm256_loadu_ps(r0 + 16));
+                    a3_0 = _mm256_add_ps(a3_0, _mm256_loadu_ps(r0 + 24));
+
+                    a0_1 = _mm256_add_ps(a0_1, _mm256_loadu_ps(r1 + 0));
+                    a1_1 = _mm256_add_ps(a1_1, _mm256_loadu_ps(r1 + 8));
+                    a2_1 = _mm256_add_ps(a2_1, _mm256_loadu_ps(r1 + 16));
+                    a3_1 = _mm256_add_ps(a3_1, _mm256_loadu_ps(r1 + 24));
+
+                    a0_2 = _mm256_add_ps(a0_2, _mm256_loadu_ps(r2 + 0));
+                    a1_2 = _mm256_add_ps(a1_2, _mm256_loadu_ps(r2 + 8));
+                    a2_2 = _mm256_add_ps(a2_2, _mm256_loadu_ps(r2 + 16));
+                    a3_2 = _mm256_add_ps(a3_2, _mm256_loadu_ps(r2 + 24));
+                }
+
                 a0_0 = apply_act(a0_0, act_type, vslope, vzero);
                 a1_0 = apply_act(a1_0, act_type, vslope, vzero);
                 a2_0 = apply_act(a2_0, act_type, vslope, vzero);
@@ -650,6 +742,8 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
                 _mm256_storeu_ps(out_row2 + 24, a3_2);
             }
         }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        s1_32_time += (t1.tv_sec - t0.tv_sec)*1000.0 + (t1.tv_nsec - t0.tv_nsec)*1e-6;
         return;
     }
 
@@ -667,16 +761,22 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
             const float* wt2 = wt + (size_t)oc2 * C * 9;
             const float* wt3 = wt + (size_t)oc3 * C * 9;
 
-            float* out0 = out->data + (size_t)oc0 * OH * OW;
-            float* out1 = out->data + (size_t)oc1 * OH * OW;
-            float* out2 = out->data + (size_t)oc2 * OH * OW;
-            float* out3 = out->data + (size_t)oc3 * OH * OW;
+            float* out0 = out->data + (size_t)oc0 * out_ch_sz;
+            float* out1 = out->data + (size_t)oc1 * out_ch_sz;
+            float* out2 = out->data + (size_t)oc2 * out_ch_sz;
+            float* out3 = out->data + (size_t)oc3 * out_ch_sz;
+            const float* res0 = res ? res->data + (size_t)oc0 * res_ch_sz : NULL;
+            const float* res1 = res ? res->data + (size_t)oc1 * res_ch_sz : NULL;
+            const float* res2 = res ? res->data + (size_t)oc2 * res_ch_sz : NULL;
+            const float* res3 = res ? res->data + (size_t)oc3 * res_ch_sz : NULL;
 
             for (int oh = 0; oh < OH; oh++) {
-                float* out_row0 = out0 + oh * OW;
-                float* out_row1 = out1 + oh * OW;
-                float* out_row2 = out2 + oh * OW;
-                float* out_row3 = out3 + oh * OW;
+                size_t out_row_off = (size_t)(out->is_padded ? (oh + 1) : oh) * out_pw + out_col_base;
+                size_t res_row_off = (size_t)((res && res->is_padded) ? (oh + 1) : oh) * res_pw + res_col_base;
+                float* out_row0 = out0 + out_row_off;
+                float* out_row1 = out1 + out_row_off;
+                float* out_row2 = out2 + out_row_off;
+                float* out_row3 = out3 + out_row_off;
 
                 for (int ow = 0; ow + 16 <= OW; ow += 16) {
                     __m256 a0_0 = vbias0, a1_0 = vbias0;
@@ -716,6 +816,21 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
                         FMA_4OC_2OW(r2, 0, 6); FMA_4OC_2OW(r2, 1, 7); FMA_4OC_2OW(r2, 2, 8);
                         #undef FMA_4OC_2OW
                     }
+                    if (res) {
+                        const float* r0 = res0 + res_row_off + ow;
+                        const float* r1 = res1 + res_row_off + ow;
+                        const float* r2 = res2 + res_row_off + ow;
+                        const float* r3 = res3 + res_row_off + ow;
+                        a0_0 = _mm256_add_ps(a0_0, _mm256_loadu_ps(r0 + 0));
+                        a1_0 = _mm256_add_ps(a1_0, _mm256_loadu_ps(r0 + 8));
+                        a0_1 = _mm256_add_ps(a0_1, _mm256_loadu_ps(r1 + 0));
+                        a1_1 = _mm256_add_ps(a1_1, _mm256_loadu_ps(r1 + 8));
+                        a0_2 = _mm256_add_ps(a0_2, _mm256_loadu_ps(r2 + 0));
+                        a1_2 = _mm256_add_ps(a1_2, _mm256_loadu_ps(r2 + 8));
+                        a0_3 = _mm256_add_ps(a0_3, _mm256_loadu_ps(r3 + 0));
+                        a1_3 = _mm256_add_ps(a1_3, _mm256_loadu_ps(r3 + 8));
+                    }
+
                     a0_0 = apply_act(a0_0, act_type, vslope, vzero);
                     a1_0 = apply_act(a1_0, act_type, vslope, vzero);
                     a0_1 = apply_act(a0_1, act_type, vslope, vzero);
@@ -732,6 +847,8 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
                 }
             }
         }
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        s1_64_time += (t1.tv_sec - t0.tv_sec)*1000.0 + (t1.tv_nsec - t0.tv_nsec)*1e-6;
         return;
     }
 
@@ -743,12 +860,16 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
         __m256 vbias1 = _mm256_set1_ps(B ? B[oc1] : 0.0f);
         const float* wt_oc0 = wt + (size_t)oc0 * C * 9;
         const float* wt_oc1 = wt + (size_t)oc1 * C * 9;
-        float* out_ch0 = out->data + (size_t)oc0 * OH * OW;
-        float* out_ch1 = out->data + (size_t)oc1 * OH * OW;
+        float* out_ch0 = out->data + (size_t)oc0 * out_ch_sz;
+        float* out_ch1 = out->data + (size_t)oc1 * out_ch_sz;
+        const float* res_ch0 = res ? res->data + (size_t)oc0 * res_ch_sz : NULL;
+        const float* res_ch1 = res ? res->data + (size_t)oc1 * res_ch_sz : NULL;
 
         for (int oh = 0; oh < OH; oh++) {
-            float* out_row0 = out_ch0 + oh * OW;
-            float* out_row1 = out_ch1 + oh * OW;
+            size_t out_row_off = (size_t)(out->is_padded ? (oh + 1) : oh) * out_pw + out_col_base;
+            size_t res_row_off = (size_t)((res && res->is_padded) ? (oh + 1) : oh) * res_pw + res_col_base;
+            float* out_row0 = out_ch0 + out_row_off;
+            float* out_row1 = out_ch1 + out_row_off;
             int ow = 0;
 
             for (; ow + 32 <= OW; ow += 32) {
@@ -786,6 +907,19 @@ static void conv_s1_forward(const Layer* L, const float* pin, Tensor* out, int i
                     #undef FMA_2OC_4OW
                 }
 
+                if (res) {
+                    const float* r0 = res_ch0 + res_row_off + ow;
+                    const float* r1 = res_ch1 + res_row_off + ow;
+                    a0_0 = _mm256_add_ps(a0_0, _mm256_loadu_ps(r0 + 0));
+                    a1_0 = _mm256_add_ps(a1_0, _mm256_loadu_ps(r0 + 8));
+                    a2_0 = _mm256_add_ps(a2_0, _mm256_loadu_ps(r0 + 16));
+                    a3_0 = _mm256_add_ps(a3_0, _mm256_loadu_ps(r0 + 24));
+                    a0_1 = _mm256_add_ps(a0_1, _mm256_loadu_ps(r1 + 0));
+                    a1_1 = _mm256_add_ps(a1_1, _mm256_loadu_ps(r1 + 8));
+                    a2_1 = _mm256_add_ps(a2_1, _mm256_loadu_ps(r1 + 16));
+                    a3_1 = _mm256_add_ps(a3_1, _mm256_loadu_ps(r1 + 24));
+                }
+
                 a0_0 = apply_act(a0_0, act_type, vslope, vzero);
                 a1_0 = apply_act(a1_0, act_type, vslope, vzero);
                 a2_0 = apply_act(a2_0, act_type, vslope, vzero);
@@ -821,12 +955,17 @@ static void conv_s2_forward(const Layer* L, const float* pin, Tensor* out, int i
     __m256 vslope = _mm256_set1_ps(act_param);
     __m256 vzero = _mm256_setzero_ps();
 
+    int out_pw = out->is_padded ? (OW + 2) : OW;
+    size_t out_ch_sz = (size_t)out_pw * (out->is_padded ? (OH + 2) : OH);
+    int out_col_base = out->is_padded ? 1 : 0;
+
     #pragma omp parallel for collapse(2) schedule(static)
     for (int oc_b = 0; oc_b < OC / 8; oc_b++) {
         for (int oh = 0; oh < OH; oh++) {
             __m256 vbias = B ? _mm256_loadu_ps(B + oc_b * 8) : _mm256_setzero_ps();
             int sy = oh * 2;
             const float* wt_block = wt_reord + (size_t)oc_b * C * 9 * 8;
+            size_t out_row_off = (size_t)(out->is_padded ? (oh + 1) : oh) * out_pw + out_col_base;
             int ow = 0;
 
             // 4-way unroll across OW: ow0, ow1, ow2, ow3
@@ -882,7 +1021,7 @@ static void conv_s2_forward(const Layer* L, const float* pin, Tensor* out, int i
                 _mm256_storeu_ps(tmp3, acc3);
 
                 for (int s = 0; s < 8; s++) {
-                    size_t ch_off = (size_t)(oc_b * 8 + s) * OH * OW + oh * OW;
+                    size_t ch_off = (size_t)(oc_b * 8 + s) * out_ch_sz + out_row_off;
                     out->data[ch_off + ow + 0] = tmp0[s];
                     out->data[ch_off + ow + 1] = tmp1[s];
                     out->data[ch_off + ow + 2] = tmp2[s];
@@ -916,47 +1055,61 @@ static void conv_s2_forward(const Layer* L, const float* pin, Tensor* out, int i
                 float tmp[8];
                 _mm256_storeu_ps(tmp, acc);
                 for (int s = 0; s < 8; s++) {
-                    out->data[(size_t)(oc_b * 8 + s) * OH * OW + oh * OW + ow] = tmp[s];
+                    size_t ch_off = (size_t)(oc_b * 8 + s) * out_ch_sz + out_row_off;
+                    out->data[ch_off + ow] = tmp[s];
                 }
             }
         }
     }
 }
 
-static void conv_forward(const Layer* L, const Tensor* in, Tensor* out) {
+static void conv_forward(const Layer* L, const Tensor* in, const Tensor* res, Tensor* out) {
     int W = in->w, H = in->h, C = in->c;
     int PW = W + 2, PH = H + 2;
-    size_t total_pin = (size_t)C * PH * PW;
-    assert(total_pin <= PIN_SCRATCH_SIZE);
-    float* pin = g_pin_scratch;
+    const float* pin = NULL;
 
-    #pragma omp parallel for schedule(static)
-    for (int c = 0; c < C; c++) {
-        float* pin_c = pin + (size_t)c * PH * PW;
-        const float* src_c = in->data + (size_t)c * H * W;
-        // Zero top row
-        for (int x = 0; x < PW; x++) pin_c[x] = 0.0f;
-        // Middle rows with inline AVX2 copy
-        for (int y = 0; y < H; y++) {
-            float* dst_row = pin_c + (y + 1) * PW;
-            const float* src_row = src_c + y * W;
-            dst_row[0] = 0.0f;
-            int x = 0;
-            for (; x <= W - 8; x += 8) {
-                _mm256_storeu_ps(dst_row + 1 + x, _mm256_loadu_ps(src_row + x));
+    struct timespec tp0, tp1;
+    clock_gettime(CLOCK_MONOTONIC, &tp0);
+
+    if (in->is_padded) {
+        pin = in->data;
+    } else {
+        size_t total_pin = (size_t)C * PH * PW;
+        assert(total_pin <= PIN_SCRATCH_SIZE);
+        pin = g_pin_scratch;
+
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int c = 0; c < C; c++) {
+            for (int y = 0; y < H; y++) {
+                float* pin_c = g_pin_scratch + (size_t)c * PH * PW;
+                const float* src_c = in->data + (size_t)c * H * W;
+                if (y == 0) memset(pin_c, 0, PW * sizeof(float));
+                float* dst_row = pin_c + (y + 1) * PW;
+                const float* src_row = src_c + y * W;
+                dst_row[0] = 0.0f;
+                int x = 0;
+                for (; x <= W - 16; x += 16) {
+                    __m256 v0 = _mm256_loadu_ps(src_row + x + 0);
+                    __m256 v1 = _mm256_loadu_ps(src_row + x + 8);
+                    _mm256_storeu_ps(dst_row + 1 + x + 0, v0);
+                    _mm256_storeu_ps(dst_row + 1 + x + 8, v1);
+                }
+                for (; x <= W - 8; x += 8) {
+                    _mm256_storeu_ps(dst_row + 1 + x, _mm256_loadu_ps(src_row + x));
+                }
+                for (; x < W; x++) dst_row[1 + x] = src_row[x];
+                dst_row[W + 1] = 0.0f;
+                if (y == H - 1) memset(pin_c + (size_t)(PH - 1) * PW, 0, PW * sizeof(float));
             }
-            for (; x < W; x++) dst_row[1 + x] = src_row[x];
-            dst_row[W + 1] = 0.0f;
         }
-        // Zero bottom row
-        float* bot_row = pin_c + (PH - 1) * PW;
-        for (int x = 0; x < PW; x++) bot_row[x] = 0.0f;
     }
+    clock_gettime(CLOCK_MONOTONIC, &tp1);
+    pad_time += (tp1.tv_sec - tp0.tv_sec)*1000.0 + (tp1.tv_nsec - tp0.tv_nsec)*1e-6;
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     if (L->stride == 1) {
-        conv_s1_forward(L, pin, out, W, H, C);
+        conv_s1_forward(L, pin, res, out, W, H, C);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         s1_time += (t1.tv_sec - t0.tv_sec)*1000.0 + (t1.tv_nsec - t0.tv_nsec)*1e-6;
     } else if (L->stride == 2) {
@@ -969,65 +1122,251 @@ static void conv_forward(const Layer* L, const Tensor* in, Tensor* out) {
 static void deconv_forward(const Layer* L, const Tensor* in, Tensor* out) {
     int W = in->w, H = in->h, C = in->c;
     int OW = out->w, OH = out->h;
+    if (L->upscale == 2) {
+        OW /= 2;
+        OH /= 2;
+    }
     const float* wt_reord = L->weights;
     const float* B = L->bias;
     float* in_hwc = g_pin_scratch;
 
-    // Pack in [C, H, W] to [H, W, C]
-    #pragma omp parallel for collapse(2) schedule(static)
-    for (int h = 0; h < H; h++) {
-        for (int w = 0; w < W; w++) {
-            float* dst = in_hwc + (h * W + w) * C;
-            for (int c = 0; c < C; c++) {
-                dst[c] = in->data[(size_t)c * H * W + h * W + w];
+    if (in->is_padded) {
+        int PW = W + 2;
+        size_t in_ch_sz = (size_t)(H + 2) * PW;
+        #pragma omp parallel for collapse(2) schedule(static)
+        for (int h = 0; h < H; h++) {
+            for (int w = 0; w < W; w++) {
+                float* dst = in_hwc + ((size_t)h * W + w) * C;
+                size_t src_offset = (size_t)(h + 1) * PW + (w + 1);
+                for (int c = 0; c < C; c += 8) {
+                    dst[c + 0] = in->data[(size_t)(c + 0) * in_ch_sz + src_offset];
+                    dst[c + 1] = in->data[(size_t)(c + 1) * in_ch_sz + src_offset];
+                    dst[c + 2] = in->data[(size_t)(c + 2) * in_ch_sz + src_offset];
+                    dst[c + 3] = in->data[(size_t)(c + 3) * in_ch_sz + src_offset];
+                    dst[c + 4] = in->data[(size_t)(c + 4) * in_ch_sz + src_offset];
+                    dst[c + 5] = in->data[(size_t)(c + 5) * in_ch_sz + src_offset];
+                    dst[c + 6] = in->data[(size_t)(c + 6) * in_ch_sz + src_offset];
+                    dst[c + 7] = in->data[(size_t)(c + 7) * in_ch_sz + src_offset];
+                }
+            }
+        }
+    } else {
+        int HW = H * W;
+        #pragma omp parallel for schedule(static)
+        for (int hw = 0; hw < HW; hw++) {
+            float* dst = in_hwc + (size_t)hw * C;
+            for (int c = 0; c < C; c += 8) {
+                dst[c + 0] = in->data[(size_t)(c + 0) * HW + hw];
+                dst[c + 1] = in->data[(size_t)(c + 1) * HW + hw];
+                dst[c + 2] = in->data[(size_t)(c + 2) * HW + hw];
+                dst[c + 3] = in->data[(size_t)(c + 3) * HW + hw];
+                dst[c + 4] = in->data[(size_t)(c + 4) * HW + hw];
+                dst[c + 5] = in->data[(size_t)(c + 5) * HW + hw];
+                dst[c + 6] = in->data[(size_t)(c + 6) * HW + hw];
+                dst[c + 7] = in->data[(size_t)(c + 7) * HW + hw];
             }
         }
     }
 
-    // Compute 2-way unrolled deconv from HWC buffer
+    __m256 b0 = B ? _mm256_loadu_ps(B + 0) : _mm256_setzero_ps();
+    __m256 b1 = B ? _mm256_loadu_ps(B + 8) : _mm256_setzero_ps();
+    __m256 b2 = B ? _mm256_loadu_ps(B + 16) : _mm256_setzero_ps();
+
+    // 2-OW unrolled + 4-channel SIMD deconvolution
     #pragma omp parallel for schedule(static)
     for (int oh = 0; oh < OH; oh++) {
         int kh_start = (oh + 1) & 1;
-        float row_buf[128 * 24];
-        for (int ow = 0; ow < OW; ow++) {
-            int kw_start = (ow + 1) & 1;
-            __m256 sum0 = B ? _mm256_loadu_ps(B + 0) : _mm256_setzero_ps();
-            __m256 sum1 = B ? _mm256_loadu_ps(B + 8) : _mm256_setzero_ps();
-            __m256 sum2 = B ? _mm256_loadu_ps(B + 16) : _mm256_setzero_ps();
+        float row_buf[OW * 24];
 
-            for (int kh = kh_start; kh < 4; kh += 2) {
-                int ih = (oh + 1 - kh) >> 1;
-                if ((unsigned)ih >= (unsigned)H) continue;
-                for (int kw = kw_start; kw < 4; kw += 2) {
-                    int iw = (ow + 1 - kw) >> 1;
-                    if ((unsigned)iw >= (unsigned)W) continue;
+        for (int parity = 0; parity < 2; parity++) {
+            int ow_start = parity;
+            int kw_start = (ow_start + 1) & 1;
+            int ow = ow_start;
 
-                    const float* wt_p = wt_reord + ((kh * 4 + kw) * C) * 24;
-                    const float* in_ptr = in_hwc + (ih * W + iw) * C;
-                    for (int c = 0; c < C; c += 2) {
-                        __m256 v0 = _mm256_set1_ps(in_ptr[c + 0]);
-                        __m256 v1 = _mm256_set1_ps(in_ptr[c + 1]);
+            for (; ow + 2 < OW; ow += 4) {
+                int ow0 = ow;
+                int ow1 = ow + 2;
 
-                        sum0 = _mm256_fmadd_ps(v0, _mm256_load_ps(wt_p + 0),  sum0);
-                        sum1 = _mm256_fmadd_ps(v0, _mm256_load_ps(wt_p + 8),  sum1);
-                        sum2 = _mm256_fmadd_ps(v0, _mm256_load_ps(wt_p + 16), sum2);
+                __m256 s0_0 = b0, s1_0 = b1, s2_0 = b2;
+                __m256 s0_1 = b0, s1_1 = b1, s2_1 = b2;
 
-                        sum0 = _mm256_fmadd_ps(v1, _mm256_load_ps(wt_p + 24), sum0);
-                        sum1 = _mm256_fmadd_ps(v1, _mm256_load_ps(wt_p + 32), sum1);
-                        sum2 = _mm256_fmadd_ps(v1, _mm256_load_ps(wt_p + 40), sum2);
+                for (int kh = kh_start; kh < 4; kh += 2) {
+                    int ih = (oh + 1 - kh) >> 1;
+                    if ((unsigned)ih >= (unsigned)H) continue;
+                    const float* in_row = in_hwc + (size_t)ih * W * C;
 
-                        wt_p += 48;
+                    for (int kw = kw_start; kw < 4; kw += 2) {
+                        int iw0 = (ow0 + 1 - kw) >> 1;
+                        int iw1 = (ow1 + 1 - kw) >> 1;
+
+                        const float* wt_p = wt_reord + ((size_t)(kh * 4 + kw) * C) * 24;
+                        const float* in0 = ((unsigned)iw0 < (unsigned)W) ? (in_row + (size_t)iw0 * C) : NULL;
+                        const float* in1 = ((unsigned)iw1 < (unsigned)W) ? (in_row + (size_t)iw1 * C) : NULL;
+
+                        if (in0 && in1) {
+                            for (int c = 0; c < C; c += 4) {
+                                __m256 w0 = _mm256_load_ps(wt_p + 0);
+                                __m256 w1 = _mm256_load_ps(wt_p + 8);
+                                __m256 w2 = _mm256_load_ps(wt_p + 16);
+                                __m256 v0_0 = _mm256_set1_ps(in0[c + 0]);
+                                __m256 v0_1 = _mm256_set1_ps(in1[c + 0]);
+                                s0_0 = _mm256_fmadd_ps(v0_0, w0, s0_0);
+                                s1_0 = _mm256_fmadd_ps(v0_0, w1, s1_0);
+                                s2_0 = _mm256_fmadd_ps(v0_0, w2, s2_0);
+                                s0_1 = _mm256_fmadd_ps(v0_1, w0, s0_1);
+                                s1_1 = _mm256_fmadd_ps(v0_1, w1, s1_1);
+                                s2_1 = _mm256_fmadd_ps(v0_1, w2, s2_1);
+
+                                __m256 w3 = _mm256_load_ps(wt_p + 24);
+                                __m256 w4 = _mm256_load_ps(wt_p + 32);
+                                __m256 w5 = _mm256_load_ps(wt_p + 40);
+                                __m256 v1_0 = _mm256_set1_ps(in0[c + 1]);
+                                __m256 v1_1 = _mm256_set1_ps(in1[c + 1]);
+                                s0_0 = _mm256_fmadd_ps(v1_0, w3, s0_0);
+                                s1_0 = _mm256_fmadd_ps(v1_0, w4, s1_0);
+                                s2_0 = _mm256_fmadd_ps(v1_0, w5, s2_0);
+                                s0_1 = _mm256_fmadd_ps(v1_1, w3, s0_1);
+                                s1_1 = _mm256_fmadd_ps(v1_1, w4, s1_1);
+                                s2_1 = _mm256_fmadd_ps(v1_1, w5, s2_1);
+
+                                __m256 w6 = _mm256_load_ps(wt_p + 48);
+                                __m256 w7 = _mm256_load_ps(wt_p + 56);
+                                __m256 w8 = _mm256_load_ps(wt_p + 64);
+                                __m256 v2_0 = _mm256_set1_ps(in0[c + 2]);
+                                __m256 v2_1 = _mm256_set1_ps(in1[c + 2]);
+                                s0_0 = _mm256_fmadd_ps(v2_0, w6, s0_0);
+                                s1_0 = _mm256_fmadd_ps(v2_0, w7, s1_0);
+                                s2_0 = _mm256_fmadd_ps(v2_0, w8, s2_0);
+                                s0_1 = _mm256_fmadd_ps(v2_1, w6, s0_1);
+                                s1_1 = _mm256_fmadd_ps(v2_1, w7, s1_1);
+                                s2_1 = _mm256_fmadd_ps(v2_1, w8, s2_1);
+
+                                __m256 w9 = _mm256_load_ps(wt_p + 72);
+                                __m256 w10 = _mm256_load_ps(wt_p + 80);
+                                __m256 w11 = _mm256_load_ps(wt_p + 88);
+                                __m256 v3_0 = _mm256_set1_ps(in0[c + 3]);
+                                __m256 v3_1 = _mm256_set1_ps(in1[c + 3]);
+                                s0_0 = _mm256_fmadd_ps(v3_0, w9, s0_0);
+                                s1_0 = _mm256_fmadd_ps(v3_0, w10, s1_0);
+                                s2_0 = _mm256_fmadd_ps(v3_0, w11, s2_0);
+                                s0_1 = _mm256_fmadd_ps(v3_1, w9, s0_1);
+                                s1_1 = _mm256_fmadd_ps(v3_1, w10, s1_1);
+                                s2_1 = _mm256_fmadd_ps(v3_1, w11, s2_1);
+
+                                wt_p += 96;
+                            }
+                        } else if (in0) {
+                            for (int c = 0; c < C; c += 2) {
+                                __m256 w0 = _mm256_load_ps(wt_p + 0);
+                                __m256 w1 = _mm256_load_ps(wt_p + 8);
+                                __m256 w2 = _mm256_load_ps(wt_p + 16);
+                                __m256 v0_0 = _mm256_set1_ps(in0[c + 0]);
+
+                                s0_0 = _mm256_fmadd_ps(v0_0, w0, s0_0);
+                                s1_0 = _mm256_fmadd_ps(v0_0, w1, s1_0);
+                                s2_0 = _mm256_fmadd_ps(v0_0, w2, s2_0);
+
+                                __m256 w3 = _mm256_load_ps(wt_p + 24);
+                                __m256 w4 = _mm256_load_ps(wt_p + 32);
+                                __m256 w5 = _mm256_load_ps(wt_p + 40);
+                                __m256 v1_0 = _mm256_set1_ps(in0[c + 1]);
+
+                                s0_0 = _mm256_fmadd_ps(v1_0, w3, s0_0);
+                                s1_0 = _mm256_fmadd_ps(v1_0, w4, s1_0);
+                                s2_0 = _mm256_fmadd_ps(v1_0, w5, s2_0);
+
+                                wt_p += 48;
+                            }
+                        } else if (in1) {
+                            for (int c = 0; c < C; c += 2) {
+                                __m256 w0 = _mm256_load_ps(wt_p + 0);
+                                __m256 w1 = _mm256_load_ps(wt_p + 8);
+                                __m256 w2 = _mm256_load_ps(wt_p + 16);
+                                __m256 v0_1 = _mm256_set1_ps(in1[c + 0]);
+
+                                s0_1 = _mm256_fmadd_ps(v0_1, w0, s0_1);
+                                s1_1 = _mm256_fmadd_ps(v0_1, w1, s1_1);
+                                s2_1 = _mm256_fmadd_ps(v0_1, w2, s2_1);
+
+                                __m256 w3 = _mm256_load_ps(wt_p + 24);
+                                __m256 w4 = _mm256_load_ps(wt_p + 32);
+                                __m256 w5 = _mm256_load_ps(wt_p + 40);
+                                __m256 v1_1 = _mm256_set1_ps(in1[c + 1]);
+
+                                s0_1 = _mm256_fmadd_ps(v1_1, w3, s0_1);
+                                s1_1 = _mm256_fmadd_ps(v1_1, w4, s1_1);
+                                s2_1 = _mm256_fmadd_ps(v1_1, w5, s2_1);
+
+                                wt_p += 48;
+                            }
+                        }
                     }
                 }
+                _mm256_storeu_ps(row_buf + ow0 * 24 + 0,  s0_0);
+                _mm256_storeu_ps(row_buf + ow0 * 24 + 8,  s1_0);
+                _mm256_storeu_ps(row_buf + ow0 * 24 + 16, s2_0);
+
+                _mm256_storeu_ps(row_buf + ow1 * 24 + 0,  s0_1);
+                _mm256_storeu_ps(row_buf + ow1 * 24 + 8,  s1_1);
+                _mm256_storeu_ps(row_buf + ow1 * 24 + 16, s2_1);
             }
-            _mm256_storeu_ps(row_buf + ow * 24 + 0,  sum0);
-            _mm256_storeu_ps(row_buf + ow * 24 + 8,  sum1);
-            _mm256_storeu_ps(row_buf + ow * 24 + 16, sum2);
+
+            // Remainder for this parity
+            for (; ow < OW; ow += 2) {
+                __m256 s0 = b0, s1 = b1, s2 = b2;
+                for (int kh = kh_start; kh < 4; kh += 2) {
+                    int ih = (oh + 1 - kh) >> 1;
+                    if ((unsigned)ih >= (unsigned)H) continue;
+                    const float* in_row = in_hwc + (size_t)ih * W * C;
+
+                    for (int kw = kw_start; kw < 4; kw += 2) {
+                        int iw = (ow + 1 - kw) >> 1;
+                        if ((unsigned)iw >= (unsigned)W) continue;
+
+                        const float* wt_p = wt_reord + ((size_t)(kh * 4 + kw) * C) * 24;
+                        const float* in_p = in_row + (size_t)iw * C;
+                        for (int c = 0; c < C; c += 2) {
+                            __m256 v0 = _mm256_set1_ps(in_p[c + 0]);
+                            __m256 v1 = _mm256_set1_ps(in_p[c + 1]);
+
+                            s0 = _mm256_fmadd_ps(v0, _mm256_load_ps(wt_p + 0),  s0);
+                            s1 = _mm256_fmadd_ps(v0, _mm256_load_ps(wt_p + 8),  s1);
+                            s2 = _mm256_fmadd_ps(v0, _mm256_load_ps(wt_p + 16), s2);
+
+                            s0 = _mm256_fmadd_ps(v1, _mm256_load_ps(wt_p + 24), s0);
+                            s1 = _mm256_fmadd_ps(v1, _mm256_load_ps(wt_p + 32), s1);
+                            s2 = _mm256_fmadd_ps(v1, _mm256_load_ps(wt_p + 40), s2);
+
+                            wt_p += 48;
+                        }
+                    }
+                }
+                _mm256_storeu_ps(row_buf + ow * 24 + 0,  s0);
+                _mm256_storeu_ps(row_buf + ow * 24 + 8,  s1);
+                _mm256_storeu_ps(row_buf + ow * 24 + 16, s2);
+            }
         }
-        for (int oc = 0; oc < 24; oc++) {
-            float* dst = out->data + (size_t)oc * OH * OW + oh * OW;
-            for (int ow = 0; ow < OW; ow++) {
-                dst[ow] = row_buf[ow * 24 + oc];
+
+        if (L->upscale == 2) {
+            int OW2 = OW * 2;
+            size_t HW2 = (size_t)(OH * 2) * OW2;
+            for (int oc_ps = 0; oc_ps < 6; oc_ps++) {
+                float* row0 = out->data + (size_t)oc_ps * HW2 + (size_t)(oh * 2 + 0) * OW2;
+                float* row1 = out->data + (size_t)oc_ps * HW2 + (size_t)(oh * 2 + 1) * OW2;
+                int ic_base = oc_ps * 4;
+                for (int ow = 0; ow < OW; ow++) {
+                    row0[ow * 2 + 0] = row_buf[ow * 24 + (ic_base + 0)];
+                    row0[ow * 2 + 1] = row_buf[ow * 24 + (ic_base + 1)];
+                    row1[ow * 2 + 0] = row_buf[ow * 24 + (ic_base + 2)];
+                    row1[ow * 2 + 1] = row_buf[ow * 24 + (ic_base + 3)];
+                }
+            }
+        } else {
+            for (int oc = 0; oc < 24; oc++) {
+                float* dst = out->data + (size_t)oc * OH * OW + oh * OW;
+                for (int ow = 0; ow < OW; ow++) {
+                    dst[ow] = row_buf[ow * 24 + oc];
+                }
             }
         }
     }
@@ -1106,16 +1445,50 @@ static void interp_forward(const Layer* L, const Tensor* in, Tensor* out) {
         beta[dy * 2 + 1] = fy;
     }
 
+    int in_pw = in->is_padded ? (W + 2) : W;
+    size_t in_ch_sz = in->is_padded ? (size_t)(H + 2) * in_pw : (size_t)H * W;
+    int in_col_base = in->is_padded ? 1 : 0;
+
+    int out_pw = out->is_padded ? (OW + 2) : OW;
+    size_t out_ch_sz = out->is_padded ? (size_t)(OH + 2) * out_pw : (size_t)OH * OW;
+    int out_col_base = out->is_padded ? 1 : 0;
+
     #pragma omp parallel for collapse(2) schedule(static)
     for (int c = 0; c < C; c++) {
         for (int dy = 0; dy < OH; dy++) {
             int sy = yofs[dy];
             float b0 = beta[dy * 2 + 0];
             float b1 = beta[dy * 2 + 1];
-            const float* row0 = in->data + (size_t)(c * H + sy) * W;
-            const float* row1 = in->data + (size_t)(c * H + sy + 1) * W;
-            float* out_row = out->data + (size_t)(c * OH + dy) * OW;
-            for (int dx = 0; dx < OW; dx++) {
+            size_t in_row0_off = (size_t)c * in_ch_sz + (size_t)(in->is_padded ? (sy + 1) : sy) * in_pw + in_col_base;
+            size_t in_row1_off = (size_t)c * in_ch_sz + (size_t)(in->is_padded ? (sy + 2) : sy + 1) * in_pw + in_col_base;
+            const float* row0 = in->data + in_row0_off;
+            const float* row1 = in->data + in_row1_off;
+            float* out_row = out->data + (size_t)c * out_ch_sz + (size_t)(out->is_padded ? (dy + 1) : dy) * out_pw + out_col_base;
+            int dx = 0;
+            for (; dx <= OW - 4; dx += 4) {
+                int sx0 = xofs[dx + 0], sx1 = xofs[dx + 1], sx2 = xofs[dx + 2], sx3 = xofs[dx + 3];
+                float a0_0 = alpha[(dx + 0) * 2 + 0], a1_0 = alpha[(dx + 0) * 2 + 1];
+                float a0_1 = alpha[(dx + 1) * 2 + 0], a1_1 = alpha[(dx + 1) * 2 + 1];
+                float a0_2 = alpha[(dx + 2) * 2 + 0], a1_2 = alpha[(dx + 2) * 2 + 1];
+                float a0_3 = alpha[(dx + 3) * 2 + 0], a1_3 = alpha[(dx + 3) * 2 + 1];
+
+                float v0_0 = row0[sx0] * a0_0 + row0[sx0 + 1] * a1_0;
+                float v1_0 = row1[sx0] * a0_0 + row1[sx0 + 1] * a1_0;
+                out_row[dx + 0] = v0_0 * b0 + v1_0 * b1;
+
+                float v0_1 = row0[sx1] * a0_1 + row0[sx1 + 1] * a1_1;
+                float v1_1 = row1[sx1] * a0_1 + row1[sx1 + 1] * a1_1;
+                out_row[dx + 1] = v0_1 * b0 + v1_1 * b1;
+
+                float v0_2 = row0[sx2] * a0_2 + row0[sx2 + 1] * a1_2;
+                float v1_2 = row1[sx2] * a0_2 + row1[sx2 + 1] * a1_2;
+                out_row[dx + 2] = v0_2 * b0 + v1_2 * b1;
+
+                float v0_3 = row0[sx3] * a0_3 + row0[sx3 + 1] * a1_3;
+                float v1_3 = row1[sx3] * a0_3 + row1[sx3 + 1] * a1_3;
+                out_row[dx + 3] = v0_3 * b0 + v1_3 * b1;
+            }
+            for (; dx < OW; dx++) {
                 int sx = xofs[dx];
                 float a0 = alpha[dx * 2 + 0];
                 float a1 = alpha[dx * 2 + 1];
@@ -1287,24 +1660,38 @@ static void binaryop_forward(const Layer* L, const Tensor* a, const Tensor* b, T
 
 static void concat_forward(const Layer* L, const Tensor* blobs, Tensor* out) {
     int H = out->h, W = out->w;
-    int HW = H * W;
-    size_t out_ch = 0;
-    for (int i = 0; i < L->in_count; i++) {
-        const Tensor* in = &blobs[L->in_idx[i]];
-        int in_c = in->c;
-        const float* src = in->data;
-        float* dst = out->data + out_ch * HW;
-        size_t N = (size_t)in_c * HW;
-        #pragma omp parallel for if(N >= 65536) schedule(static)
-        for (size_t j = 0; j <= N - 32; j += 32) {
-            _mm256_storeu_ps(dst + j +  0, _mm256_loadu_ps(src + j +  0));
-            _mm256_storeu_ps(dst + j +  8, _mm256_loadu_ps(src + j +  8));
-            _mm256_storeu_ps(dst + j + 16, _mm256_loadu_ps(src + j + 16));
-            _mm256_storeu_ps(dst + j + 24, _mm256_loadu_ps(src + j + 24));
+    if (out->is_padded) {
+        int PW = W + 2;
+        size_t out_ch_sz = (size_t)(H + 2) * PW;
+        size_t out_ch = 0;
+        for (int i = 0; i < L->in_count; i++) {
+            const Tensor* in = &blobs[L->in_idx[i]];
+            int in_c = in->c;
+            int in_pw = in->is_padded ? (in->w + 2) : in->w;
+            size_t in_ch_sz = in->is_padded ? (size_t)(in->h + 2) * in_pw : (size_t)in->h * in->w;
+            int in_col_base = in->is_padded ? 1 : 0;
+            #pragma omp parallel for collapse(2) schedule(static)
+            for (int c = 0; c < in_c; c++) {
+                for (int y = 0; y < H; y++) {
+                    const float* src_row = in->data + (size_t)c * in_ch_sz + (size_t)(in->is_padded ? (y + 1) : y) * in_pw + in_col_base;
+                    float* dst_row = out->data + (size_t)(out_ch + c) * out_ch_sz + (size_t)(y + 1) * PW + 1;
+                    memcpy(dst_row, src_row, W * sizeof(float));
+                }
+            }
+            out_ch += in_c;
         }
-        size_t start = (N / 32) * 32;
-        for (size_t j = start; j < N; j++) dst[j] = src[j];
-        out_ch += in_c;
+    } else {
+        int HW = H * W;
+        size_t out_ch = 0;
+        for (int i = 0; i < L->in_count; i++) {
+            const Tensor* in = &blobs[L->in_idx[i]];
+            int in_c = in->c;
+            const float* src = in->data;
+            float* dst = out->data + out_ch * HW;
+            size_t N = (size_t)in_c * HW;
+            memcpy(dst, src, N * sizeof(float));
+            out_ch += in_c;
+        }
     }
 }
 
@@ -1343,6 +1730,12 @@ static void warp_forward(const Tensor* img, const Tensor* flow, Tensor* out) {
     const float* fxptr = flow->data;
     const float* fyptr = flow->data + (size_t)H * W;
     size_t HW = (size_t)H * W;
+    const float* in0 = img->data;
+    const float* in1 = img->data + HW;
+    const float* in2 = img->data + HW * 2;
+    float* out0 = out->data;
+    float* out1 = out->data + HW;
+    float* out2 = out->data + HW * 2;
 
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < H; y++) {
@@ -1354,8 +1747,10 @@ static void warp_forward(const Tensor* img, const Tensor* flow, Tensor* out) {
             float sample_x = (float)x + fx_row[x];
             float sample_y = (float)y + fy_row[x];
 
-            int x0 = (int)floorf(sample_x);
-            int y0 = (int)floorf(sample_y);
+            float flx = _mm_cvtss_f32(_mm_floor_ss(_mm_setzero_ps(), _mm_set_ss(sample_x)));
+            float fly = _mm_cvtss_f32(_mm_floor_ss(_mm_setzero_ps(), _mm_set_ss(sample_y)));
+            int x0 = (int)flx;
+            int y0 = (int)fly;
             int x1 = x0 + 1;
             int y1 = y0 + 1;
 
@@ -1364,8 +1759,10 @@ static void warp_forward(const Tensor* img, const Tensor* flow, Tensor* out) {
             if (x1 < 0) x1 = 0; else if (x1 > W - 1) x1 = W - 1;
             if (y1 < 0) y1 = 0; else if (y1 > H - 1) y1 = H - 1;
 
-            float alpha = sample_x - (float)x0;
-            float beta  = sample_y - (float)y0;
+            float alpha = sample_x - flx;
+            float beta  = sample_y - fly;
+            float inv_alpha = 1.0f - alpha;
+            float inv_beta  = 1.0f - beta;
 
             size_t idx00 = (size_t)y0 * W + x0;
             size_t idx01 = (size_t)y0 * W + x1;
@@ -1373,31 +1770,113 @@ static void warp_forward(const Tensor* img, const Tensor* flow, Tensor* out) {
             size_t idx11 = (size_t)y1 * W + x1;
             size_t dst_idx = row_dst + x;
 
-            for (int c = 0; c < C; c++) {
-                const float* in_ch = img->data + (size_t)c * HW;
-                float v0 = in_ch[idx00];
-                float v1 = in_ch[idx01];
-                float v2 = in_ch[idx10];
-                float v3 = in_ch[idx11];
+            if (C == 3) {
+                float v4_0 = in0[idx00] * inv_alpha + in0[idx01] * alpha;
+                float v5_0 = in0[idx10] * inv_alpha + in0[idx11] * alpha;
+                out0[dst_idx] = v4_0 * inv_beta + v5_0 * beta;
 
-                float v4 = v0 * (1.0f - alpha) + v1 * alpha;
-                float v5 = v2 * (1.0f - alpha) + v3 * alpha;
-                out->data[(size_t)c * HW + dst_idx] = v4 * (1.0f - beta) + v5 * beta;
+                float v4_1 = in1[idx00] * inv_alpha + in1[idx01] * alpha;
+                float v5_1 = in1[idx10] * inv_alpha + in1[idx11] * alpha;
+                out1[dst_idx] = v4_1 * inv_beta + v5_1 * beta;
+
+                float v4_2 = in2[idx00] * inv_alpha + in2[idx01] * alpha;
+                float v5_2 = in2[idx10] * inv_alpha + in2[idx11] * alpha;
+                out2[dst_idx] = v4_2 * inv_beta + v5_2 * beta;
+            } else {
+                for (int c = 0; c < C; c++) {
+                    const float* in_ch = img->data + (size_t)c * HW;
+                    float v0 = in_ch[idx00];
+                    float v1 = in_ch[idx01];
+                    float v2 = in_ch[idx10];
+                    float v3 = in_ch[idx11];
+
+                    float v4 = v0 * inv_alpha + v1 * alpha;
+                    float v5 = v2 * inv_alpha + v3 * alpha;
+                    out->data[(size_t)c * HW + dst_idx] = v4 * inv_beta + v5 * beta;
+                }
             }
         }
     }
 }
 
+/* =====================  GRAPH OPTIMIZATION PASSES  ===================== */
+
+static void fuse_resblocks(Graph* g) {
+    int fused_count = 0;
+    for (int i = 0; i < g->n_layers - 2; i++) {
+        Layer* L_conv = &g->layers[i];
+        if (L_conv->type != LT_CONV || L_conv->stride != 1 || L_conv->kernel != 3 || L_conv->act_type != 0 || L_conv->out_count != 1) {
+            continue;
+        }
+        int conv_out_blob = L_conv->out_idx[0];
+
+        Layer* L_add = &g->layers[i + 1];
+        if (L_add->type != LT_BINARYOP || L_add->op_type != 0 || L_add->with_scalar || L_add->in_count != 2 || L_add->out_count != 1) {
+            continue;
+        }
+        if (L_add->in_idx[0] != conv_out_blob && L_add->in_idx[1] != conv_out_blob) {
+            continue;
+        }
+        int res_blob = (L_add->in_idx[0] == conv_out_blob) ? L_add->in_idx[1] : L_add->in_idx[0];
+        int add_out_blob = L_add->out_idx[0];
+
+        Layer* L_relu = &g->layers[i + 2];
+        if (L_relu->type != LT_RELU || L_relu->in_count != 1 || L_relu->out_count != 1 || L_relu->in_idx[0] != add_out_blob) {
+            continue;
+        }
+        int relu_out_blob = L_relu->out_idx[0];
+
+        // Fuse ResBlock: Conv computes (conv(x) + res) followed by activation
+        L_conv->res_blob_idx = res_blob;
+        L_conv->act_type = (L_relu->relu_slope > 0.0f) ? 2 : 1;
+        L_conv->act_params[0] = L_relu->relu_slope;
+        L_conv->out_idx[0] = relu_out_blob;
+
+        L_add->type = LT_NOP;
+        L_relu->type = LT_NOP;
+
+        fused_count++;
+        i += 2; // Skip past add and relu
+    }
+    printf("Fused %d ResBlocks (conv + res_add + leakyrelu)\n", fused_count);
+}
+
+static void fuse_deconv_pixelshuffle(Graph* g) {
+    int fused_count = 0;
+    for (int i = 0; i < g->n_layers - 1; i++) {
+        Layer* L_deconv = &g->layers[i];
+        if (L_deconv->type != LT_DECONV) continue;
+
+        Layer* L_ps = &g->layers[i + 1];
+        if (L_ps->type != LT_PIXELSHUFFLE || L_ps->upscale != 2) continue;
+        if (L_ps->in_idx[0] != L_deconv->out_idx[0]) continue;
+
+        // Fuse! Deconv writes directly to pixelshuffle output tensor
+        L_deconv->out_idx[0] = L_ps->out_idx[0];
+        L_deconv->upscale = 2;
+        L_ps->type = LT_NOP;
+
+        fused_count++;
+    }
+    printf("Fused %d Deconv+PixelShuffle blocks\n", fused_count);
+}
+
 /* =====================  GRAPH EXECUTION  ===================== */
 
 static void graph_execute(const Graph* g, Tensor* blobs) {
+    s1_time = 0;
+    s2_time = 0;
+    pad_time = 0;
+    s1_8_time = 0; s1_16_time = 0; s1_32_time = 0; s1_64_time = 0;
     double type_times[16] = {0};
     for (int i = 0; i < g->n_layers; i++) {
         const Layer* L = &g->layers[i];
+        if (L->type == LT_NOP) continue;
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
         switch (L->type) {
             case LT_INPUT:
+            case LT_NOP:
                 break;
             case LT_SPLIT:
                 /* Zero-copy: output tensors already alias input data pointer */
@@ -1408,9 +1887,11 @@ static void graph_execute(const Graph* g, Tensor* blobs) {
             case LT_INTERP:
                 interp_forward(L, &blobs[L->in_idx[0]], &blobs[L->out_idx[0]]);
                 break;
-            case LT_CONV:
-                conv_forward(L, &blobs[L->in_idx[0]], &blobs[L->out_idx[0]]);
+            case LT_CONV: {
+                const Tensor* res = (L->res_blob_idx >= 0) ? &blobs[L->res_blob_idx] : NULL;
+                conv_forward(L, &blobs[L->in_idx[0]], res, &blobs[L->out_idx[0]]);
                 break;
+            }
             case LT_DECONV:
                 deconv_forward(L, &blobs[L->in_idx[0]], &blobs[L->out_idx[0]]);
                 break;
@@ -1450,7 +1931,8 @@ static void graph_execute(const Graph* g, Tensor* blobs) {
             printf("  %-14s: %6.2f ms\n", type_names[t], type_times[t]);
         }
     }
-    printf("    -> Conv S=1: %6.2f ms, Conv S=2: %6.2f ms\n", s1_time, s2_time);
+    printf("    -> Conv S=1: %6.2f ms, Conv S=2: %6.2f ms, Conv Pad: %6.2f ms\n",
+           s1_time, s2_time, pad_time);
 }
 
 /* =====================  IMAGE I/O (stb)  ===================== */
@@ -1499,8 +1981,8 @@ static void save_image_rgb(const char* path, const Tensor* t) {
 /* =====================  MAIN  ===================== */
 
 int main(int argc, char** argv) {
-    if (argc != 6) {
-        fprintf(stderr, "usage: %s model.bin frame0.png frame1.png timestep out.png\n", argv[0]);
+    if (argc < 6) {
+        fprintf(stderr, "usage: %s model.bin frame0.png frame1.png timestep out.png [iterations]\n", argv[0]);
         return 1;
     }
 
@@ -1527,6 +2009,9 @@ int main(int argc, char** argv) {
         fprintf(stderr, "Failed to load bin: %s\n", bin_path);
         return 1;
     }
+
+    fuse_resblocks(&g);
+    fuse_deconv_pixelshuffle(&g);
 
     // Allocate persistent padding workspace
     g_pin_scratch = (float*)aligned_alloc(64, PIN_SCRATCH_SIZE * sizeof(float));
@@ -1561,7 +2046,7 @@ int main(int argc, char** argv) {
 
     for (int i = 0; i < g.n_layers; i++) {
         Layer* L = &g.layers[i];
-        if (L->type == LT_INPUT) continue;
+        if (L->type == LT_INPUT || L->type == LT_NOP) continue;
 
         int iw = shapes[L->in_idx[0]][0];
         int ih = shapes[L->in_idx[0]][1];
@@ -1599,6 +2084,11 @@ int main(int argc, char** argv) {
                 ow = (iw - 1) * L->stride - 2 * L->pad + L->kernel;
                 oh = (ih - 1) * L->stride - 2 * L->pad + L->kernel;
                 oc = L->num_output;
+                if (L->upscale == 2) {
+                    ow *= 2;
+                    oh *= 2;
+                    oc /= 4;
+                }
                 break;
             case LT_RELU:
             case LT_SIGMOID:
@@ -1644,12 +2134,26 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Determine which blobs should have zero-padded border
+    int blob_is_padded[MAX_BLOBS] = {0};
+    for (int i = 0; i < g.n_layers; i++) {
+        const Layer* L = &g.layers[i];
+        if (L->type == LT_CONV) {
+            blob_is_padded[L->out_idx[0]] = 1;
+            blob_is_padded[L->in_idx[0]] = 1;
+        }
+    }
+
     // Allocate blob tensors: non-aliased get fresh memory; aliased share data
     Tensor* blobs = (Tensor*)calloc(g.n_blobs, sizeof(Tensor));
     for (int i = 0; i < g.n_blobs; i++) {
         if (shapes[i][0] > 0 && shapes[i][1] > 0 && shapes[i][2] > 0) {
             if (alias_of[i] == -1) {
-                blobs[i] = tensor_make(shapes[i][0], shapes[i][1], shapes[i][2]);
+                if (blob_is_padded[i]) {
+                    blobs[i] = tensor_make_padded(shapes[i][0], shapes[i][1], shapes[i][2]);
+                } else {
+                    blobs[i] = tensor_make(shapes[i][0], shapes[i][1], shapes[i][2]);
+                }
             } else {
                 blobs[i].w = shapes[i][0];
                 blobs[i].h = shapes[i][1];
@@ -1670,6 +2174,7 @@ int main(int argc, char** argv) {
                 root = alias_of[root];
             }
             blobs[i].data = blobs[root].data + total_off;
+            blobs[i].is_padded = blobs[root].is_padded;
         }
     }
 
@@ -1689,15 +2194,47 @@ int main(int argc, char** argv) {
         blobs[in2_idx].data[i] = timestep;
     }
 
-    // Run graph
-    struct timespec ts0, ts1;
-    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    int iters = (argc > 6) ? atoi(argv[6]) : 1;
 
-    graph_execute(&g, blobs);
+    if (iters > 1) {
+        // Warmup run
+        graph_execute(&g, blobs);
 
-    clock_gettime(CLOCK_MONOTONIC, &ts1);
-    double elapsed_ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) * 1e-6;
-    printf("Inference time: %.2f ms\n", elapsed_ms);
+        double total_ms = 0.0;
+        double min_ms = 1e9, max_ms = 0.0;
+        double* times = (double*)malloc(iters * sizeof(double));
+
+        for (int it = 0; it < iters; it++) {
+            struct timespec ts0, ts1;
+            clock_gettime(CLOCK_MONOTONIC, &ts0);
+            graph_execute(&g, blobs);
+            clock_gettime(CLOCK_MONOTONIC, &ts1);
+            double ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) * 1e-6;
+            times[it] = ms;
+            total_ms += ms;
+            if (ms < min_ms) min_ms = ms;
+            if (ms > max_ms) max_ms = ms;
+        }
+        double mean_ms = total_ms / iters;
+        double variance = 0.0;
+        for (int it = 0; it < iters; it++) {
+            variance += (times[it] - mean_ms) * (times[it] - mean_ms);
+        }
+        double std_ms = sqrt(variance / iters);
+        printf("Warm Inference (%d runs): Mean = %.2f ms, Std = %.2f ms, Min = %.2f ms, Max = %.2f ms\n",
+               iters, mean_ms, std_ms, min_ms, max_ms);
+        free(times);
+    } else {
+        // Single run
+        struct timespec ts0, ts1;
+        clock_gettime(CLOCK_MONOTONIC, &ts0);
+
+        graph_execute(&g, blobs);
+
+        clock_gettime(CLOCK_MONOTONIC, &ts1);
+        double elapsed_ms = (ts1.tv_sec - ts0.tv_sec) * 1000.0 + (ts1.tv_nsec - ts0.tv_nsec) * 1e-6;
+        printf("Inference time: %.2f ms\n", elapsed_ms);
+    }
 
     // Extract output
     int out_idx = blob_idx(&g, "out0");
