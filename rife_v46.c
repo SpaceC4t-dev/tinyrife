@@ -1965,6 +1965,7 @@ typedef struct IFBlock {
     float* w0b;            /* [c/16][c0][9][16] */
     float* U[8];           /* Winograd weights [K][c/16][c][16] */
     int m, K;              /* Winograd output tile (4 or 6), K = (m+2)^2 */
+    int nt_out;            /* streaming stores for the res-conv outputs */
     int in_w, in_h;        /* input size the buffers were built for */
     P8 a, x, y;            /* conv0a out, ping-pong for the res convs */
     int G, S;              /* tile groups per task, OC splits */
@@ -2174,7 +2175,7 @@ static inline void wino_gemm_6x16(const float* v, const float* u, int ICb, float
 /* Output transform of tile t for channel block ocb, + bias + residual, lrelu.
  * m: 36 vectors, k-th at m + k*ks. */
 static inline void wino_out_tile(const float* m, size_t ks, const float* bias, __m256 vs,
-                                 const P8* in, P8* out, int t, int tw, int ocb) {
+                                 const P8* in, P8* out, int t, int tw, int ocb, int nt) {
     int H = in->H, W = in->W;
     int ty = t / tw, tx = t % tw;
     int ny = H - 4 * ty < 4 ? H - 4 * ty : 4;
@@ -2193,8 +2194,8 @@ static inline void wino_out_tile(const float* m, size_t ks, const float* bias, _
         const float* res = p8_at(in, ocb, 4 * ty + r + 1, 4 * tx + 1);
         float* dst = p8_at(out, ocb, 4 * ty + r + 1, 4 * tx + 1);
         for (int c = 0; c < nx; c++) {
-            __m256 v = _mm256_add_ps(_mm256_add_ps(o[c], vb), _mm256_loadu_ps(res + c * 8));
-            _mm256_storeu_ps(dst + c * 8, lrelu8(v, vs));
+            __m256 v = lrelu8(_mm256_add_ps(_mm256_add_ps(o[c], vb), _mm256_loadu_ps(res + c * 8)), vs);
+            if (nt) _mm256_stream_ps(dst + c * 8, v); else _mm256_storeu_ps(dst + c * 8, v);
         }
     }
 }
@@ -2248,7 +2249,7 @@ static inline void wino6_in_tile(const P8* in, int ty, int tx, int cb, float* ds
 }
 
 static inline void wino6_out_tile(const float* m, size_t ks, const float* bias, __m256 vs,
-                                  const P8* in, P8* out, int t, int tw, int ocb) {
+                                  const P8* in, P8* out, int t, int tw, int ocb, int nt) {
     int H = in->H, W = in->W;
     int ty = t / tw, tx = t % tw;
     int ny = H - 6 * ty < 6 ? H - 6 * ty : 6;
@@ -2267,8 +2268,8 @@ static inline void wino6_out_tile(const float* m, size_t ks, const float* bias, 
         const float* res = p8_at(in, ocb, 6 * ty + r + 1, 6 * tx + 1);
         float* dst = p8_at(out, ocb, 6 * ty + r + 1, 6 * tx + 1);
         for (int c = 0; c < nx; c++) {
-            __m256 v = _mm256_add_ps(_mm256_add_ps(o[c], vb), _mm256_loadu_ps(res + c * 8));
-            _mm256_storeu_ps(dst + c * 8, lrelu8(v, vs));
+            __m256 v = lrelu8(_mm256_add_ps(_mm256_add_ps(o[c], vb), _mm256_loadu_ps(res + c * 8)), vs);
+            if (nt) _mm256_stream_ps(dst + c * 8, v); else _mm256_storeu_ps(dst + c * 8, v);
         }
     }
 }
@@ -2282,13 +2283,17 @@ static void wino_conv_res(const IFBlock* B, const float* U, const float* bias, f
     int th = (H + m - 1) / m, tw = (W + m - 1) / m, T = th * tw;
     int NG = (T + 5) / 6;                 /* groups of 6 tiles */
     __m256 vs = _mm256_set1_ps(slope);
+    /* Outputs much larger than L3 are written with streaming stores: they skip
+     * the read-for-ownership of each line, which roughly halves the bandwidth
+     * left for loads on this memory-bound path. */
+    int nt = B->nt_out;
 
     if (B->global) {
         /* Few tiles, large weights: transform everything once, then run the GEMMs
          * split over (k, OC block) so each weight slice is read exactly once. */
         float* V = B->gV;                  /* [K][NG][ICb][6][8] */
         float* M = B->gM;                  /* [NG*6][K][C]       */
-        size_t ks = (size_t)NG * ICb * 48;
+        size_t ks = (size_t)NG * ICb * 48 + 16;   /* +1 cache line: spread the K slices over L1 sets */
         #pragma omp parallel
         {
             #pragma omp for collapse(2) schedule(static)
@@ -2314,8 +2319,9 @@ static void wino_conv_res(const IFBlock* B, const float* U, const float* bias, f
             #pragma omp for collapse(2) schedule(static)
             for (int t = 0; t < T; t++) {
                 for (int ocb = 0; ocb < C / 8; ocb++)
-                    (m == 6 ? wino6_out_tile : wino_out_tile)(M + (size_t)t * K * C + ocb * 8, C, bias, vs, in, out, t, tw, ocb);
+                    (m == 6 ? wino6_out_tile : wino_out_tile)(M + (size_t)t * K * C + ocb * 8, C, bias, vs, in, out, t, tw, ocb, nt);
             }
+            if (nt) _mm_sfence();
         }
         return;
     }
@@ -2328,8 +2334,8 @@ static void wino_conv_res(const IFBlock* B, const float* U, const float* bias, f
     {
         float* ws = g_wino_ws + (size_t)omp_get_thread_num() * g_wino_ws_per_thread;
         float* V = ws;                                      /* [K][G][ICb][6][8] */
-        float* M = ws + (size_t)K * G * 6 * C;             /* [G*6][K][OCt]     */
-        size_t ks = (size_t)G * ICb * 48;
+        size_t ks = (size_t)G * ICb * 48 + 16;              /* +1 cache line: spread the K slices over L1 sets */
+        float* M = ws + (size_t)K * ks;                     /* [G*6][K][OCt]     */
 
         #pragma omp for schedule(dynamic, 1)
         for (int task = 0; task < ntg * S; task++) {
@@ -2339,10 +2345,10 @@ static void wino_conv_res(const IFBlock* B, const float* U, const float* bias, f
             if (ob0 >= ob1) continue;
             int OCt = (ob1 - ob0) * 16;
 
-            for (int gi = 0; gi < gn; gi++) {
-                for (int jt = 0; jt < 6; jt++) {
-                    int t = (g0 + gi) * 6 + jt;
-                    for (int cb = 0; cb < ICb; cb++) {
+            for (int cb = 0; cb < ICb; cb++) {
+                for (int gi = 0; gi < gn; gi++) {
+                    for (int jt = 0; jt < 6; jt++) {
+                        int t = (g0 + gi) * 6 + jt;
                         float* dst = V + ((size_t)gi * ICb + cb) * 48 + jt * 8;
                         if (t < T) {
                             (m == 6 ? wino6_in_tile : wino_in_tile)(in, t / tw, t % tw, cb, dst, ks);
@@ -2360,13 +2366,15 @@ static void wino_conv_res(const IFBlock* B, const float* U, const float* bias, f
                                        M + ((size_t)(gi * 6) * K + k) * OCt + (ob - ob0) * 16, (size_t)K * OCt);
                 }
             }
-            for (int tl = 0; tl < gn * 6; tl++) {
-                int t = g0 * 6 + tl;
-                if (t >= T) break;
-                for (int ocb = ob0 * 2; ocb < ob1 * 2; ocb++)
-                    (m == 6 ? wino6_out_tile : wino_out_tile)(M + (size_t)tl * K * OCt + (ocb - ob0 * 2) * 8, OCt, bias, vs, in, out, t, tw, ocb);
+            for (int ocb = ob0 * 2; ocb < ob1 * 2; ocb++) {
+                for (int tl = 0; tl < gn * 6; tl++) {
+                    int t = g0 * 6 + tl;
+                    if (t >= T) break;
+                    (m == 6 ? wino6_out_tile : wino_out_tile)(M + (size_t)tl * K * OCt + (ocb - ob0 * 2) * 8, OCt, bias, vs, in, out, t, tw, ocb, nt);
+                }
             }
         }
+        if (nt) _mm_sfence();
     }
 }
 
@@ -2421,6 +2429,10 @@ static void ifblock_prepare(IFBlock* B, int in_w, int in_h) {
     int m = B->m, K = B->K;
     for (int i = 0; i < 8; i++) B->U[i] = wino_weights(B->res[i].weights, C, C, m);
     int T = ((H2 + m - 1) / m) * ((W2 + m - 1) / m), NG = (T + 5) / 6;
+    size_t act_bytes = (size_t)C * B->x.PH * B->x.PW * sizeof(float);
+    B->nt_out = act_bytes > (8u << 20);     /* well beyond L3 (2 x 4 MB on Zen 2) */
+    const char* nenv = getenv("RIFE_NT");
+    if (nenv) B->nt_out = atoi(nenv);
     int nt = omp_get_max_threads();
     /* keep V + M for one task around 256 KB (L2 is 512 KB on Zen 2) */
     size_t per_group = (size_t)K * 6 * (C + C) * sizeof(float);
@@ -2439,7 +2451,7 @@ static void ifblock_prepare(IFBlock* B, int in_w, int in_h) {
     /* Weights larger than what one task should stream, and few enough tiles
      * that transforming them all at once stays cache-friendly. */
     size_t u_bytes = (size_t)K * C * C * sizeof(float);
-    size_t v_bytes = (size_t)K * NG * 6 * C * sizeof(float);
+    size_t v_bytes = (size_t)K * (NG * 6 * C + 16) * sizeof(float);
     B->global = u_bytes > 2 * v_bytes;
     const char* env = getenv("RIFE_WINO_GLOBAL");
     if (env) B->global = atoi(env);
@@ -2449,7 +2461,7 @@ static void ifblock_prepare(IFBlock* B, int in_w, int in_h) {
         assert(B->gV && B->gM);
     }
 
-    size_t need = (size_t)K * G * 6 * C * 2;
+    size_t need = (size_t)K * ((size_t)G * 6 * C + 16) + (size_t)K * G * 6 * C;   /* V (padded), M */
     if (need > g_wino_ws_per_thread) {
         free(g_wino_ws);
         g_wino_ws_per_thread = need;
