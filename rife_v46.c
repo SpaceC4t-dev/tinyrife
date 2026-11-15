@@ -1775,6 +1775,7 @@ static void concat_forward(const Layer* L, const Tensor* blobs, Tensor* out) {
             int in_pw = in->is_padded ? (in->w + 2) : in->w;
             size_t in_ch_sz = in->is_padded ? (size_t)(in->h + 2) * in_pw : (size_t)in->h * in->w;
             int in_col_base = in->is_padded ? 1 : 0;
+            if (in->data == out->data + out_ch * out_ch_sz) { out_ch += in_c; continue; }  /* written in place */
             #pragma omp parallel for collapse(2) schedule(static)
             for (int c = 0; c < in_c; c++) {
                 for (int y = 0; y < H; y++) {
@@ -1793,6 +1794,7 @@ static void concat_forward(const Layer* L, const Tensor* blobs, Tensor* out) {
             int in_c = in->c;
             const float* src = in->data;
             float* dst = out->data + out_ch * HW;
+            if (src == dst) { out_ch += in_c; continue; }  /* written in place */
             size_t N = (size_t)in_c * HW;
             size_t chunk = 1 << 16;
             #pragma omp parallel for schedule(static)
@@ -1841,15 +1843,19 @@ static void warp_forward(const Tensor* img, const Tensor* flow, Tensor* out) {
     const float* in0 = img->data;
     const float* in1 = img->data + HW;
     const float* in2 = img->data + HW * 2;
-    float* out0 = out->data;
-    float* out1 = out->data + HW;
-    float* out2 = out->data + HW * 2;
+    /* The output may be a (padded) channel slice of a concat buffer. */
+    assert(!img->is_padded && !flow->is_padded);
+    int opw = out->is_padded ? W + 2 : W;
+    size_t ohw = out->is_padded ? (size_t)(H + 2) * opw : HW;
+    float* out0 = out->data + (out->is_padded ? opw + 1 : 0);
+    float* out1 = out0 + ohw;
+    float* out2 = out0 + ohw * 2;
 
     #pragma omp parallel for schedule(static)
     for (int y = 0; y < H; y++) {
         const float* fx_row = fxptr + y * W;
         const float* fy_row = fyptr + y * W;
-        size_t row_dst = (size_t)y * W;
+        size_t row_dst = (size_t)y * opw;
 
         for (int x = 0; x < W; x++) {
             float sample_x = (float)x + fx_row[x];
@@ -1900,7 +1906,7 @@ static void warp_forward(const Tensor* img, const Tensor* flow, Tensor* out) {
 
                     float v4 = v0 * inv_alpha + v1 * alpha;
                     float v5 = v2 * inv_alpha + v3 * alpha;
-                    out->data[(size_t)c * HW + dst_idx] = v4 * inv_beta + v5 * beta;
+                    out0[(size_t)c * ohw + dst_idx] = v4 * inv_beta + v5 * beta;
                 }
             }
         }
@@ -2681,7 +2687,8 @@ int main(int argc, char** argv) {
     shapes[in1_idx][0] = wp; shapes[in1_idx][1] = hp; shapes[in1_idx][2] = 3;
     shapes[in2_idx][0] = wp; shapes[in2_idx][1] = hp; shapes[in2_idx][2] = 1;
 
-    // Alias tracking: alias_of[blob_id] = root_blob_id (-1 if owns memory)
+    // Alias tracking: alias_of[blob_id] = parent blob (-1 if owns memory);
+    // alias_offset = channel offset into the parent.
     int alias_of[MAX_BLOBS];
     int alias_offset[MAX_BLOBS];
     for (int i = 0; i < MAX_BLOBS; i++) {
@@ -2760,7 +2767,7 @@ int main(int argc, char** argv) {
                 oh = ih;
                 oc = L->crop_end - L->crop_start;
                 alias_of[L->out_idx[0]] = L->in_idx[0];
-                alias_offset[L->out_idx[0]] = L->crop_start * ih * iw;
+                alias_offset[L->out_idx[0]] = L->crop_start;
                 break;
             case LT_BINARYOP:
                 if (L->with_scalar) {
@@ -2798,6 +2805,44 @@ int main(int argc, char** argv) {
         }
     }
 
+    // Write-in-place: a blob whose only consumer is a Concat, produced by an op
+    // that can write any (padded or not) channel slice, becomes a view of its
+    // slice of the Concat output. The producer then writes straight into the
+    // concat buffer and Concat skips it (warp -> concat, concat -> concat, ...).
+    {
+        int producer[MAX_BLOBS], consumers[MAX_BLOBS];
+        for (int i = 0; i < MAX_BLOBS; i++) { producer[i] = -1; consumers[i] = 0; }
+        for (int i = 0; i < g.n_layers; i++) {
+            const Layer* L = &g.layers[i];
+            if (L->type == LT_NOP || L->type == LT_INPUT) continue;
+            for (int o = 0; o < L->out_count; o++) producer[L->out_idx[o]] = i;
+            for (int j = 0; j < L->in_count; j++) consumers[L->in_idx[j]]++;
+            if (L->type == LT_CONV && L->res_blob_idx >= 0) consumers[L->res_blob_idx]++;
+        }
+        consumers[blob_idx(&g, "out0")]++;
+        int n_inplace = 0;
+        for (int i = 0; i < g.n_layers; i++) {
+            const Layer* Q = &g.layers[i];
+            if (Q->type != LT_CONCAT) continue;
+            int ch = 0;
+            for (int j = 0; j < Q->in_count; j++) {
+                int x = Q->in_idx[j];
+                int p = producer[x];
+                LayerType pt = p >= 0 ? g.layers[p].type : LT_NOP;
+                int dup = 0;
+                for (int k = 0; k < Q->in_count; k++) dup += (Q->in_idx[k] == x);
+                if (alias_of[x] == -1 && consumers[x] == 1 && dup == 1 && !blob_is_padded[x] &&
+                    (pt == LT_WARP || pt == LT_INTERP || pt == LT_CONCAT)) {
+                    alias_of[x] = Q->out_idx[0];
+                    alias_offset[x] = ch;
+                    n_inplace++;
+                }
+                ch += shapes[x][2];
+            }
+        }
+        printf("Concat inputs written in place: %d\n", n_inplace);
+    }
+
     // Allocate blob tensors: non-aliased get fresh memory; aliased share data
     Tensor* blobs = (Tensor*)calloc(g.n_blobs, sizeof(Tensor));
     for (int i = 0; i < g.n_blobs; i++) {
@@ -2822,13 +2867,16 @@ int main(int argc, char** argv) {
     for (int i = 0; i < g.n_blobs; i++) {
         if (alias_of[i] != -1) {
             int root = alias_of[i];
-            int total_off = alias_offset[i];
+            int total_ch = alias_offset[i];
             while (alias_of[root] != -1) {
-                total_off += alias_offset[root];
+                total_ch += alias_offset[root];
                 root = alias_of[root];
             }
-            blobs[i].data = blobs[root].data + total_off;
-            blobs[i].is_padded = blobs[root].is_padded;
+            const Tensor* R = &blobs[root];
+            size_t plane = R->is_padded ? (size_t)(R->h + 2) * (R->w + 2) : (size_t)R->h * R->w;
+            assert(R->w == blobs[i].w && R->h == blobs[i].h);
+            blobs[i].data = R->data + (size_t)total_ch * plane;
+            blobs[i].is_padded = R->is_padded;
         }
     }
 
