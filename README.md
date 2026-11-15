@@ -4,6 +4,8 @@ RIFE v4.6 frame interpolation ([Practical-RIFE](https://github.com/hzwer/Practic
 [rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan) model files) implemented with **OpenGL 4.3 core compute
 shaders**, fp32 only, no extensions.
 
+A single-file C CPU port (Winograd + OpenMP, ~3.5x faster than PyTorch on CPU) lives in [`cpu/`](cpu/README.md).
+
 ## Setup
 
 ```sh

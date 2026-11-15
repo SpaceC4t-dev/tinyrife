@@ -4,3 +4,9 @@ inputs/
 outputs/
 *.webm
 *.mp4
+rife_v46
+bench_ncnn
+out.png
+ref_out.png
+*.o
+*.bak
