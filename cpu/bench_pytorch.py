@@ -1,13 +1,16 @@
+import argparse
+import os
+import sys
 import time
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 
-torch.set_num_threads(4)
 torch.set_grad_enabled(False)
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 def conv(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilation=1):
     return nn.Sequential(
@@ -116,15 +119,36 @@ class IFNet(nn.Module):
         mask_list[3] = torch.sigmoid(mask_list[3])
         return merged[3][0] * mask_list[3] + merged[3][1] * (1 - mask_list[3])
 
-def run_bench(iters=10):
-    model = IFNet()
-    state_dict = torch.load('/tmp/flownet_v4.6.pkl', map_location='cpu')
-    clean_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-    model.load_state_dict(clean_state_dict)
-    model.eval()
+def load_ncnn_weights(model, param_path, bin_path):
+    """Load the repo's ncnn flownet-v46 weights (ResConv beta is already folded into the conv weights)."""
+    sys.path.insert(0, os.path.join(HERE, ".."))
+    from ncnn_weights import load_ncnn
+    layers = load_ncnn(param_path, bin_path)
+    for bi, blk in enumerate([model.block0, model.block1, model.block2, model.block3]):
+        L = layers[bi * 11:(bi + 1) * 11]
+        mods = [blk.conv0[0][0], blk.conv0[1][0]] + [rc.conv for rc in blk.convblock]
+        for m, l in zip(mods, L[:10]):
+            m.weight.copy_(torch.from_numpy(l["weight"]))
+            m.bias.copy_(torch.from_numpy(l["bias"]))
+        for rc in blk.convblock:
+            rc.beta.fill_(1.0)
+        d = blk.lastconv[0]
+        d.weight.copy_(torch.from_numpy(L[10]["weight"]).transpose(0, 1))
+        d.bias.copy_(torch.from_numpy(L[10]["bias"]))
 
-    im0 = np.array(Image.open('/home/user/repos/playground/frame0.png').convert('RGB')).astype(np.float32) / 255.0
-    im1 = np.array(Image.open('/home/user/repos/playground/frame1.png').convert('RGB')).astype(np.float32) / 255.0
+def run_bench(args):
+    torch.set_num_threads(args.threads)
+    model = IFNet()
+    if args.weights:
+        state_dict = torch.load(args.weights, map_location='cpu')
+        model.load_state_dict({k.replace('module.', ''): v for k, v in state_dict.items()})
+    else:
+        load_ncnn_weights(model, args.ncnn_param, args.ncnn_bin)
+    model.eval()
+    iters = args.iters
+
+    im0 = np.array(Image.open(args.frame0).convert('RGB')).astype(np.float32) / 255.0
+    im1 = np.array(Image.open(args.frame1).convert('RGB')).astype(np.float32) / 255.0
 
     t0 = torch.from_numpy(im0).permute(2, 0, 1).unsqueeze(0)
     t1 = torch.from_numpy(im1).permute(2, 0, 1).unsqueeze(0)
@@ -152,16 +176,28 @@ def run_bench(iters=10):
     min_ms = np.min(times)
     max_ms = np.max(times)
 
-    print(f"Practical-RIFE (PyTorch CPU, 4 threads, {iters} runs): Mean = {mean_ms:.2f} ms, Std = {std_ms:.2f} ms, Min = {min_ms:.2f} ms, Max = {max_ms:.2f} ms")
+    print(f"Practical-RIFE (PyTorch CPU, {args.threads} threads, {iters} runs): Mean = {mean_ms:.2f} ms, Std = {std_ms:.2f} ms, Min = {min_ms:.2f} ms, Max = {max_ms:.2f} ms")
 
     out_np = (out.squeeze(0).permute(1, 2, 0).clamp(0, 1).numpy() * 255.0 + 0.5).astype(np.uint8)
-    Image.fromarray(out_np).save('/tmp/bench_pytorch_out.png')
+    if args.out:
+        Image.fromarray(out_np).save(args.out)
 
-    ref = np.array(Image.open('/home/user/repos/playground/ref_out.png').convert('RGB'))
-    diff = np.abs(ref.astype(int) - out_np.astype(int))
-    mse = np.mean((ref.astype(float) - out_np.astype(float))**2)
-    psnr = 20 * np.log10(255.0 / np.sqrt(mse)) if mse > 0 else float('inf')
-    print(f"PyTorch Output Fidelity: Max diff = {diff.max()}, Mean abs diff = {diff.mean():.6f}, PSNR = {psnr:.2f} dB")
+    if args.ref:
+        ref = np.array(Image.open(args.ref).convert('RGB'))
+        diff = np.abs(ref.astype(int) - out_np.astype(int))
+        mse = np.mean((ref.astype(float) - out_np.astype(float))**2)
+        psnr = 20 * np.log10(255.0 / np.sqrt(mse)) if mse > 0 else float('inf')
+        print(f"PyTorch Output Fidelity: Max diff = {diff.max()}, Mean abs diff = {diff.mean():.6f}, PSNR = {psnr:.2f} dB")
 
 if __name__ == '__main__':
-    run_bench(10)
+    ap = argparse.ArgumentParser(description="Benchmark Practical-RIFE v4.6 (PyTorch CPU) on one frame pair")
+    ap.add_argument('--frame0', default=os.path.join(HERE, 'frame0.png'))
+    ap.add_argument('--frame1', default=os.path.join(HERE, 'frame1.png'))
+    ap.add_argument('--weights', help="Practical-RIFE flownet_v4.6.pkl; default: the ncnn weights next to this script")
+    ap.add_argument('--ncnn-param', default=os.path.join(HERE, 'flownet-v46.param'))
+    ap.add_argument('--ncnn-bin', default=os.path.join(HERE, 'flownet-v46.bin'))
+    ap.add_argument('--threads', type=int, default=4)
+    ap.add_argument('--iters', type=int, default=10)
+    ap.add_argument('--out', help="save the interpolated frame here")
+    ap.add_argument('--ref', help="reference image to report max diff / PSNR against")
+    run_bench(ap.parse_args())

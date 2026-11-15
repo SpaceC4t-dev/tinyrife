@@ -35,6 +35,17 @@ for f in frames:
     mid = g.interpolate_bytes(0.5)   # tight RGB24 bytes, ready for an ffmpeg rawvideo pipe
 ```
 
+## C host (`gl_c/`)
+
+`gl_c/rife_gl.c` is the same pipeline with the host side in C instead of Python: EGL via `dlopen` (no GL/EGL headers,
+build is `gcc -O2 rife_gl.c -o rife_gl -ldl -lm`), weights parsed straight from the ncnn files, the GLSL taken from
+`gl_rife.py` (`gl_c/gen_shaders.py` regenerates `shaders.h`). Output is bit-identical to the Python host and GPU time is
+the same (the GPU does the work; Python only dispatches ~53 shaders):
+
+```sh
+./gl_c/rife_gl [-m model_dir] [-t 0.5] [-b N] frame0.png frame1.png out.png   # -b N: also time N runs
+```
+
 ## Implementation
 
 Tensors live in SSBOs in a pack4 layout (`vec4[C/4][H][W]`); conv weights are pre-packed as `mat4` so each 4-in/4-out
