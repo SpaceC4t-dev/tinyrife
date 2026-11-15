@@ -1943,8 +1943,8 @@ typedef struct {
 
 static void p8_alloc(P8* t, int C, int H, int W) {
     t->C = C; t->H = H; t->W = W;
-    t->PH = ((H + 3) / 4) * 4 + 2;
-    t->PW = ((W + 3) / 4) * 4 + 2;
+    t->PH = ((H + 11) / 12) * 12 + 2;   /* whole 4x4 or 6x6 Winograd tiles + border */
+    t->PW = ((W + 11) / 12) * 12 + 2;
     size_t n = (size_t)C * t->PH * t->PW;
     t->data = (float*)aligned_alloc(64, (n * sizeof(float) + 63) & ~(size_t)63);
     assert(t->data);
@@ -1963,7 +1963,8 @@ typedef struct IFBlock {
     int c0, c;             /* channels after conv0a / conv0b */
     float* w0a;            /* [c0/16][Cin][9][16] */
     float* w0b;            /* [c/16][c0][9][16] */
-    float* U[8];           /* Winograd weights [36][c/16][c][16] */
+    float* U[8];           /* Winograd weights [K][c/16][c][16] */
+    int m, K;              /* Winograd output tile (4 or 6), K = (m+2)^2 */
     int in_w, in_h;        /* input size the buffers were built for */
     P8 a, x, y;            /* conv0a out, ping-pong for the res convs */
     int G, S;              /* tile groups per task, OC splits */
@@ -2076,9 +2077,9 @@ static void conv3x3s2_p8(const float* in, int pack, size_t in_plane, int in_PW, 
     o3 = _mm256_add_ps(_mm256_fmadd_ps(_mm256_set1_ps(8.0f), _d, _b), m5); \
 } while (0)
 
-/* raw [OC][IC][3][3] -> U [36][OC/16][IC][16], U = G g G^T */
-static float* wino_weights(const float* raw, int OC, int IC) {
-    static const double G[6][3] = {
+/* raw [OC][IC][3][3] -> U [K][OC/16][IC][16], U = G g G^T, for F(m x m, 3x3) */
+static float* wino_weights(const float* raw, int OC, int IC, int m) {
+    static const double G4[6][3] = {
         { 1.0 / 4,  0,         0       },
         {-1.0 / 6, -1.0 / 6,  -1.0 / 6 },
         {-1.0 / 6,  1.0 / 6,  -1.0 / 6 },
@@ -2086,21 +2087,33 @@ static float* wino_weights(const float* raw, int OC, int IC) {
         { 1.0 / 24, -1.0 / 12, 1.0 / 6 },
         { 0,        0,         1       },
     };
+    static const double G6[8][3] = {
+        { 1,          0,          0         },
+        {-2.0 / 9,   -2.0 / 9,   -2.0 / 9   },
+        {-2.0 / 9,    2.0 / 9,   -2.0 / 9   },
+        { 1.0 / 90,   1.0 / 45,   2.0 / 45  },
+        { 1.0 / 90,  -1.0 / 45,   2.0 / 45  },
+        { 32.0 / 45,  16.0 / 45,  8.0 / 45  },
+        { 32.0 / 45, -16.0 / 45,  8.0 / 45  },
+        { 0,          0,          1         },
+    };
+    const double (*G)[3] = m == 6 ? G6 : G4;
+    int T = m + 2, K = T * T;
     int nob = OC / 16;
-    size_t n = (size_t)36 * OC * IC;
+    size_t n = (size_t)K * OC * IC;
     float* U = (float*)aligned_alloc(64, (n * sizeof(float) + 63) & ~(size_t)63);
     assert(U);
     for (int oc = 0; oc < OC; oc++) {
         for (int ic = 0; ic < IC; ic++) {
             const float* g = raw + ((size_t)oc * IC + ic) * 9;
-            double t[6][3];
-            for (int i = 0; i < 6; i++)
+            double t[8][3];
+            for (int i = 0; i < T; i++)
                 for (int j = 0; j < 3; j++)
                     t[i][j] = G[i][0] * g[0 * 3 + j] + G[i][1] * g[1 * 3 + j] + G[i][2] * g[2 * 3 + j];
-            for (int i = 0; i < 6; i++) {
-                for (int j = 0; j < 6; j++) {
+            for (int i = 0; i < T; i++) {
+                for (int j = 0; j < T; j++) {
                     double u = t[i][0] * G[j][0] + t[i][1] * G[j][1] + t[i][2] * G[j][2];
-                    int k = i * 6 + j;
+                    int k = i * T + j;
                     U[(((size_t)k * nob + oc / 16) * IC + ic) * 16 + oc % 16] = (float)u;
                 }
             }
@@ -2186,20 +2199,95 @@ static inline void wino_out_tile(const float* m, size_t ks, const float* bias, _
     }
 }
 
+/* ---------- Winograd F(6x6, 3x3): 8x8 input tiles, 64 products ---------- */
+
+/* 1-D B^T (8 -> 8), points 0, +-1, +-2, +-1/2 */
+#define WINO6_BT(d, r) do { \
+    __m256 _t1, _t2; \
+    r[0] = _mm256_fmadd_ps(_mm256_sub_ps(d[4], d[2]), _mm256_set1_ps(5.25f), _mm256_sub_ps(d[0], d[6])); \
+    r[7] = _mm256_fmadd_ps(_mm256_sub_ps(d[3], d[5]), _mm256_set1_ps(5.25f), _mm256_sub_ps(d[7], d[1])); \
+    _t1 = _mm256_fnmadd_ps(d[4], _mm256_set1_ps(4.25f), _mm256_add_ps(d[2], d[6])); \
+    _t2 = _mm256_fnmadd_ps(d[3], _mm256_set1_ps(4.25f), _mm256_add_ps(d[1], d[5])); \
+    r[1] = _mm256_add_ps(_t1, _t2); r[2] = _mm256_sub_ps(_t1, _t2); \
+    _t1 = _mm256_fnmadd_ps(d[4], _mm256_set1_ps(1.25f), _mm256_fmadd_ps(d[2], _mm256_set1_ps(0.25f), d[6])); \
+    _t2 = _mm256_fmadd_ps(d[5], _mm256_set1_ps(2.0f), _mm256_fnmadd_ps(d[3], _mm256_set1_ps(2.5f), _mm256_mul_ps(d[1], _mm256_set1_ps(0.5f)))); \
+    r[3] = _mm256_add_ps(_t1, _t2); r[4] = _mm256_sub_ps(_t1, _t2); \
+    _t1 = _mm256_fmadd_ps(_mm256_fnmadd_ps(d[4], _mm256_set1_ps(1.25f), d[2]), _mm256_set1_ps(4.0f), d[6]); \
+    _t2 = _mm256_fmadd_ps(d[5], _mm256_set1_ps(0.5f), _mm256_fnmadd_ps(d[3], _mm256_set1_ps(2.5f), _mm256_mul_ps(d[1], _mm256_set1_ps(2.0f)))); \
+    r[5] = _mm256_add_ps(_t1, _t2); r[6] = _mm256_sub_ps(_t1, _t2); \
+} while (0)
+
+/* 1-D A^T (8 -> 6) */
+#define WINO6_AT(m, o) do { \
+    __m256 _a1 = _mm256_add_ps(m[1], m[2]), _b1 = _mm256_sub_ps(m[1], m[2]); \
+    __m256 _a2 = _mm256_add_ps(m[3], m[4]), _b2 = _mm256_sub_ps(m[3], m[4]); \
+    __m256 _a3 = _mm256_add_ps(m[5], m[6]), _b3 = _mm256_sub_ps(m[5], m[6]); \
+    o[0] = _mm256_add_ps(_mm256_add_ps(m[0], _a1), _mm256_add_ps(_a2, _a3)); \
+    o[1] = _mm256_fmadd_ps(_b3, _mm256_set1_ps(0.5f), _mm256_fmadd_ps(_b2, _mm256_set1_ps(2.0f), _b1)); \
+    o[2] = _mm256_fmadd_ps(_a3, _mm256_set1_ps(0.25f), _mm256_fmadd_ps(_a2, _mm256_set1_ps(4.0f), _a1)); \
+    o[3] = _mm256_fmadd_ps(_b3, _mm256_set1_ps(0.125f), _mm256_fmadd_ps(_b2, _mm256_set1_ps(8.0f), _b1)); \
+    o[4] = _mm256_fmadd_ps(_a3, _mm256_set1_ps(0.0625f), _mm256_fmadd_ps(_a2, _mm256_set1_ps(16.0f), _a1)); \
+    o[5] = _mm256_add_ps(m[7], _mm256_fmadd_ps(_b3, _mm256_set1_ps(0.03125f), _mm256_fmadd_ps(_b2, _mm256_set1_ps(32.0f), _b1))); \
+} while (0)
+
+static inline void wino6_in_tile(const P8* in, int ty, int tx, int cb, float* dst, size_t ks) {
+    const float* src = in->data + (size_t)cb * p8_plane(in) + ((size_t)(6 * ty) * in->PW + 6 * tx) * 8;
+    size_t rs = (size_t)in->PW * 8;
+    __m256 t[8][8];
+    for (int c = 0; c < 8; c++) {
+        __m256 d[8], r[8];
+        for (int k = 0; k < 8; k++) d[k] = _mm256_loadu_ps(src + c * 8 + k * rs);
+        WINO6_BT(d, r);
+        for (int k = 0; k < 8; k++) t[k][c] = r[k];
+    }
+    for (int i = 0; i < 8; i++) {
+        __m256 r[8];
+        WINO6_BT(t[i], r);
+        for (int j = 0; j < 8; j++) _mm256_storeu_ps(dst + (i * 8 + j) * ks, r[j]);
+    }
+}
+
+static inline void wino6_out_tile(const float* m, size_t ks, const float* bias, __m256 vs,
+                                  const P8* in, P8* out, int t, int tw, int ocb) {
+    int H = in->H, W = in->W;
+    int ty = t / tw, tx = t % tw;
+    int ny = H - 6 * ty < 6 ? H - 6 * ty : 6;
+    int nx = W - 6 * tx < 6 ? W - 6 * tx : 6;
+    __m256 s[6][8];
+    for (int j = 0; j < 8; j++) {
+        __m256 col[8], o[6];
+        for (int i = 0; i < 8; i++) col[i] = _mm256_loadu_ps(m + (i * 8 + j) * ks);
+        WINO6_AT(col, o);
+        for (int r = 0; r < 6; r++) s[r][j] = o[r];
+    }
+    __m256 vb = _mm256_loadu_ps(bias + ocb * 8);
+    for (int r = 0; r < ny; r++) {
+        __m256 o[6];
+        WINO6_AT(s[r], o);
+        const float* res = p8_at(in, ocb, 6 * ty + r + 1, 6 * tx + 1);
+        float* dst = p8_at(out, ocb, 6 * ty + r + 1, 6 * tx + 1);
+        for (int c = 0; c < nx; c++) {
+            __m256 v = _mm256_add_ps(_mm256_add_ps(o[c], vb), _mm256_loadu_ps(res + c * 8));
+            _mm256_storeu_ps(dst + c * 8, lrelu8(v, vs));
+        }
+    }
+}
+
 /* out = lrelu(conv3x3(in) + bias + in), in/out packed P8 with C channels. */
 static void wino_conv_res(const IFBlock* B, const float* U, const float* bias, float slope,
                           const P8* in, P8* out) {
     int C = in->C, H = in->H, W = in->W;
     int ICb = C / 8, nob = C / 16;
-    int th = (H + 3) / 4, tw = (W + 3) / 4, T = th * tw;
+    int m = B->m, K = B->K;
+    int th = (H + m - 1) / m, tw = (W + m - 1) / m, T = th * tw;
     int NG = (T + 5) / 6;                 /* groups of 6 tiles */
     __m256 vs = _mm256_set1_ps(slope);
 
     if (B->global) {
         /* Few tiles, large weights: transform everything once, then run the GEMMs
          * split over (k, OC block) so each weight slice is read exactly once. */
-        float* V = B->gV;                  /* [36][NG][ICb][6][8] */
-        float* M = B->gM;                  /* [NG*6][36][C]       */
+        float* V = B->gV;                  /* [K][NG][ICb][6][8] */
+        float* M = B->gM;                  /* [NG*6][K][C]       */
         size_t ks = (size_t)NG * ICb * 48;
         #pragma omp parallel
         {
@@ -2208,25 +2296,25 @@ static void wino_conv_res(const IFBlock* B, const float* U, const float* bias, f
                 for (int cb = 0; cb < ICb; cb++) {
                     float* dst = V + ((size_t)(t / 6) * ICb + cb) * 48 + (t % 6) * 8;
                     if (t < T) {
-                        wino_in_tile(in, t / tw, t % tw, cb, dst, ks);
+                        (m == 6 ? wino6_in_tile : wino_in_tile)(in, t / tw, t % tw, cb, dst, ks);
                     } else {
-                        for (int k = 0; k < 36; k++) _mm256_storeu_ps(dst + k * ks, _mm256_setzero_ps());
+                        for (int k = 0; k < K; k++) _mm256_storeu_ps(dst + k * ks, _mm256_setzero_ps());
                     }
                 }
             }
             #pragma omp for collapse(2) schedule(static)
-            for (int k = 0; k < 36; k++) {
+            for (int k = 0; k < K; k++) {
                 for (int ob = 0; ob < nob; ob++) {
                     const float* u = U + ((size_t)k * nob + ob) * C * 16;
                     for (int gi = 0; gi < NG; gi++)
                         wino_gemm_6x16(V + k * ks + (size_t)gi * ICb * 48, u, ICb,
-                                       M + ((size_t)(gi * 6) * 36 + k) * C + ob * 16, (size_t)36 * C);
+                                       M + ((size_t)(gi * 6) * K + k) * C + ob * 16, (size_t)K * C);
                 }
             }
             #pragma omp for collapse(2) schedule(static)
             for (int t = 0; t < T; t++) {
                 for (int ocb = 0; ocb < C / 8; ocb++)
-                    wino_out_tile(M + (size_t)t * 36 * C + ocb * 8, C, bias, vs, in, out, t, tw, ocb);
+                    (m == 6 ? wino6_out_tile : wino_out_tile)(M + (size_t)t * K * C + ocb * 8, C, bias, vs, in, out, t, tw, ocb);
             }
         }
         return;
@@ -2239,8 +2327,8 @@ static void wino_conv_res(const IFBlock* B, const float* U, const float* bias, f
     #pragma omp parallel
     {
         float* ws = g_wino_ws + (size_t)omp_get_thread_num() * g_wino_ws_per_thread;
-        float* V = ws;                                      /* [36][G][ICb][6][8] */
-        float* M = ws + (size_t)36 * G * 6 * C;             /* [G*6][36][OCt]     */
+        float* V = ws;                                      /* [K][G][ICb][6][8] */
+        float* M = ws + (size_t)K * G * 6 * C;             /* [G*6][K][OCt]     */
         size_t ks = (size_t)G * ICb * 48;
 
         #pragma omp for schedule(dynamic, 1)
@@ -2257,26 +2345,26 @@ static void wino_conv_res(const IFBlock* B, const float* U, const float* bias, f
                     for (int cb = 0; cb < ICb; cb++) {
                         float* dst = V + ((size_t)gi * ICb + cb) * 48 + jt * 8;
                         if (t < T) {
-                            wino_in_tile(in, t / tw, t % tw, cb, dst, ks);
+                            (m == 6 ? wino6_in_tile : wino_in_tile)(in, t / tw, t % tw, cb, dst, ks);
                         } else {
-                            for (int k = 0; k < 36; k++) _mm256_storeu_ps(dst + k * ks, _mm256_setzero_ps());
+                            for (int k = 0; k < K; k++) _mm256_storeu_ps(dst + k * ks, _mm256_setzero_ps());
                         }
                     }
                 }
             }
-            for (int k = 0; k < 36; k++) {
+            for (int k = 0; k < K; k++) {
                 for (int ob = ob0; ob < ob1; ob++) {
                     const float* u = U + ((size_t)k * nob + ob) * C * 16;
                     for (int gi = 0; gi < gn; gi++)
                         wino_gemm_6x16(V + k * ks + (size_t)gi * ICb * 48, u, ICb,
-                                       M + ((size_t)(gi * 6) * 36 + k) * OCt + (ob - ob0) * 16, (size_t)36 * OCt);
+                                       M + ((size_t)(gi * 6) * K + k) * OCt + (ob - ob0) * 16, (size_t)K * OCt);
                 }
             }
             for (int tl = 0; tl < gn * 6; tl++) {
                 int t = g0 * 6 + tl;
                 if (t >= T) break;
                 for (int ocb = ob0 * 2; ocb < ob1 * 2; ocb++)
-                    wino_out_tile(M + (size_t)tl * 36 * OCt + (ocb - ob0 * 2) * 8, OCt, bias, vs, in, out, t, tw, ocb);
+                    (m == 6 ? wino6_out_tile : wino_out_tile)(M + (size_t)tl * K * OCt + (ocb - ob0 * 2) * 8, OCt, bias, vs, in, out, t, tw, ocb);
             }
         }
     }
@@ -2306,10 +2394,9 @@ static IFBlock* ifblock_create(const Layer* L0a, const Layer* L0b, const Layer* 
                             s2[q]->weights[((((size_t)ob * 2 + s / 8) * C + c) * 9 + k) * 8 + s % 8];
         *dst[q] = w;
     }
-    for (int i = 0; i < 8; i++) {
+    for (int i = 0; i < 8; i++)
         assert(res[i]->num_output == B->c && res[i]->weight_data_size == B->c * B->c * 9);
-        B->U[i] = wino_weights(res[i]->weights, B->c, B->c);
-    }
+    /* Winograd weights are built in ifblock_prepare, once the tile size is chosen */
     return B;
 }
 
@@ -2324,17 +2411,26 @@ static void ifblock_prepare(IFBlock* B, int in_w, int in_h) {
     p8_alloc(&B->y, B->c, H2, W2);
 
     int C = B->c, nob = C / 16;
-    int T = ((H2 + 3) / 4) * ((W2 + 3) / 4), NG = (T + 5) / 6;
+    /* F(6x6) needs 64/36 = 1.8x the weight memory of F(4x4): it wins on the
+     * narrow, high-resolution blocks (<= 96 ch) and loses on the wide ones,
+     * whose weights then no longer fit the cache budget (measured on Zen 2). */
+    B->m = C <= 96 ? 6 : 4;
+    const char* tenv = getenv("RIFE_WINO_TILE");
+    if (tenv) B->m = atoi(tenv) == 4 ? 4 : 6;
+    B->K = (B->m + 2) * (B->m + 2);
+    int m = B->m, K = B->K;
+    for (int i = 0; i < 8; i++) B->U[i] = wino_weights(B->res[i].weights, C, C, m);
+    int T = ((H2 + m - 1) / m) * ((W2 + m - 1) / m), NG = (T + 5) / 6;
     int nt = omp_get_max_threads();
     /* keep V + M for one task around 256 KB (L2 is 512 KB on Zen 2) */
-    size_t per_group = (size_t)36 * 6 * (C + C) * sizeof(float);
+    size_t per_group = (size_t)K * 6 * (C + C) * sizeof(float);
     int G = (int)((256 * 1024) / per_group);
     if (G < 1) G = 1;
     if (G > 4) G = 4;
     while (G > 1 && (NG + G - 1) / G < 3 * nt) G--;
     /* Split OC so each split's weights (~2 MB) stay in L3 while all threads
      * work through it (tasks are ordered split-major), and for parallelism. */
-    size_t u_all = (size_t)36 * C * C * sizeof(float);
+    size_t u_all = (size_t)K * C * C * sizeof(float);
     int S = (int)((u_all + (2u << 20) - 1) / (2u << 20));
     if (S > nob) S = nob;
     while (S < nob && ((NG + G - 1) / G) * S < 3 * nt) S++;
@@ -2342,8 +2438,8 @@ static void ifblock_prepare(IFBlock* B, int in_w, int in_h) {
 
     /* Weights larger than what one task should stream, and few enough tiles
      * that transforming them all at once stays cache-friendly. */
-    size_t u_bytes = (size_t)36 * C * C * sizeof(float);
-    size_t v_bytes = (size_t)36 * NG * 6 * C * sizeof(float);
+    size_t u_bytes = (size_t)K * C * C * sizeof(float);
+    size_t v_bytes = (size_t)K * NG * 6 * C * sizeof(float);
     B->global = u_bytes > 2 * v_bytes;
     const char* env = getenv("RIFE_WINO_GLOBAL");
     if (env) B->global = atoi(env);
@@ -2353,7 +2449,7 @@ static void ifblock_prepare(IFBlock* B, int in_w, int in_h) {
         assert(B->gV && B->gM);
     }
 
-    size_t need = (size_t)36 * G * 6 * C * 2;
+    size_t need = (size_t)K * G * 6 * C * 2;
     if (need > g_wino_ws_per_thread) {
         free(g_wino_ws);
         g_wino_ws_per_thread = need;
