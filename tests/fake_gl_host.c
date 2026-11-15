@@ -1,6 +1,7 @@
-/* A stand-in for gl_host.c with the same API (gl_host.h): no GPU, and the "interpolated" frame is the rounded average of
- * the two pushed frames, so the output of gl_dir can be predicted exactly. Used to test gl_dir's directory handling and
- * threading without a GL context, and to run it under ThreadSanitizer without the GL driver's own threads in the way. */
+/* A stand-in for gl_host.c with the same API (gl_host.h): no GPU, and the "interpolated" frame is the linear blend of
+ * the two pushed frames at the requested timestep, so the output of gl_dir and gl_video can be predicted exactly. Used to
+ * test their handling and threading without a GL context, and to run them under ThreadSanitizer without the GL driver's
+ * own threads in the way. */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,10 +47,11 @@ void rife_push(Rife *r, const uint8_t *rgb) {
   r->count++;
 }
 
+/* prev * (1 - t) + last * t, rounded; tests/check_video.c computes the same expression. At t = 0.5 this is (a + b + 1) / 2. */
 void rife_interpolate(Rife *r, float timestep, uint8_t *out) {
   if (r->count < 2) rife_die("push two frames first");
-  (void)timestep;   /* gl_dir only asks for 0.5 */
-  for (size_t i = 0; i < r->nbytes; i++) out[i] = (uint8_t)((r->prev[i] + r->last[i] + 1) >> 1);
+  double t = (double)timestep;
+  for (size_t i = 0; i < r->nbytes; i++) out[i] = (uint8_t)((double)r->prev[i] * (1.0 - t) + (double)r->last[i] * t + 0.5);
 }
 
 double rife_gpu_ms(Rife *r, float timestep) { (void)r; (void)timestep; return 0; }

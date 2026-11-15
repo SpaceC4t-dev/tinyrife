@@ -8,6 +8,7 @@
 # choice depends on cache sizes and GL drivers differ in the last bit.
 cd "$(dirname "$0")/.." || exit 2
 B=${BUILD:-build}
+TO=; command -v timeout >/dev/null 2>&1 && TO="timeout 10"   # a hung pipe must fail a test, not stall the suite
 MODEL=${MODEL:-ext/rife-ncnn-vulkan/models/rife-v4.6}
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
@@ -16,7 +17,7 @@ ok()  { echo "PASS  $1"; pass=$((pass + 1)); }
 bad() { echo "FAIL  $1${2:+ -- $2}"; fail=$((fail + 1)); }
 skp() { echo "SKIP  $1 ($2)"; skip=$((skip + 1)); }
 
-for f in $B/cpu $B/gl $B/gl_dir $B/gl_dir_fake $B/check_dir $B/pngdiff; do
+for f in $B/cpu $B/gl $B/gl_dir $B/gl_dir_fake $B/check_dir $B/gl_video $B/gl_video_fake $B/check_video $B/pngdiff; do
   [ -x "$f" ] || { echo "missing $f: run make first (or make sanitize)"; exit 2; }
 done
 # ---- gl_dir with the fake GL host (average of the two frames): structure, copies, threading, errors; no GPU, no model ----
@@ -37,7 +38,7 @@ $B/gl_dir_fake "$S3" "$T/o3" >"$T/log" 2>&1 && out=$($B/check_dir "$S3" "$T/o3" 
 
 rejects() { # description, expected message, command...
   d=$1; want=$2; shift 2
-  if "$@" >"$T/log" 2>&1; then bad "$d" "exited 0"; elif grep -q "$want" "$T/log"; then ok "$d"; else bad "$d" "$(tail -1 "$T/log")"; fi
+  if $TO "$@" >"$T/log" 2>&1; then bad "$d" "exited 0"; elif grep -q "$want" "$T/log"; then ok "$d"; else bad "$d" "$(tail -1 "$T/log")"; fi
 }
 mkdir "$T/one"; cp data/tiny0.png "$T/one/a.png"
 mkdir "$T/mismatch"; cp data/tiny0.png "$T/mismatch/a.png"; cp data/frame0.png "$T/mismatch/b.png"; cp data/tiny1.png "$T/mismatch/c.png"
@@ -64,6 +65,77 @@ if [ -x "$B/gl_dir_fake_tsan" ]; then
   done
   if [ $racy -eq 0 ]; then ok "dir threading under ThreadSanitizer"; else bad "dir threading under ThreadSanitizer" "$(grep -m1 -A3 ThreadSanitizer "$T/log" | tr '\n' ' ')"; fi
 fi
+
+# ---- gl_video with fake ffmpeg/ffprobe scripts and the fake GL host: exact output, the ffmpeg command lines, error paths.
+# No ffmpeg, GPU, codec or model needed (raw RGB24 files stand in for videos; see tests/fake_ffmpeg.sh). ----
+FK="env FFMPEG=tests/fake_ffmpeg.sh FFPROBE=tests/fake_ffprobe.sh FAKE_W=64 FAKE_H=48 FAKE_RATE=30000/1001 FAKE_LOG=$T/ff.log"
+$B/check_video gen "$T/v.raw" 64 48 6 1
+$B/check_video gen "$T/v1.raw" 64 48 1 2
+{ cat "$T/v.raw"; head -c 1000 /dev/zero; } > "$T/v_partial.raw"     # a cut-off last frame must be dropped
+vtest() { # name, multiplier, input, extra args...
+  name=$1; mult=$2; vin=$3; shift 3
+  rm -f "$T/ff.log" "$T/vo.raw"
+  if $TO $FK $B/gl_video_fake -x "$mult" "$@" "$vin" "$T/vo.raw" >"$T/log" 2>&1; then
+    out=$($B/check_video verify "$vin" "$T/vo.raw" 64 48 "$mult") && ok "video: $name" || bad "video: $name" "$out"
+  else bad "video: $name" "$(tail -1 "$T/log")"; fi
+}
+logs_have() { # description, patterns that must all appear in the ffmpeg command lines
+  d=$1; shift
+  for pat in "$@"; do grep -q -- "$pat" "$T/ff.log" || { bad "$d" "not in the ffmpeg command lines: $pat"; return; }; done
+  ok "$d"
+}
+vtest "x1 copies every frame"                 1 "$T/v.raw"
+vtest "x3 blends at 1/3 and 2/3"              3 "$T/v.raw"
+vtest "x5"                                    5 "$T/v.raw"
+vtest "a single frame is repeated x times"    3 "$T/v1.raw"
+vtest "a cut-off last frame is dropped"       2 "$T/v_partial.raw"
+vtest "x2, default codec, no trim"            2 "$T/v.raw"
+logs_have "video: encoder gets the doubled rate, size, default codec, audio copy" \
+  "-r 60000/1001 -i -" "-s 64x48 " "-map 1:a? -c:a copy -c:v libsvtav1 -preset 8 -crf 28 -pix_fmt yuv420p"
+logs_have "video: decoder asks for raw rgb24 on stdout" "-f rawvideo -pix_fmt rgb24 -$"
+grep -q -- " -t " "$T/ff.log" && bad "video: no -t unless asked" "-t was passed" || ok "video: no -t unless asked"
+vtest "custom codec and -t reach both ffmpegs" 2 "$T/v.raw" --vcodec "libx264 -crf 20 -preset fast" -t 2.5
+logs_have "video: --vcodec options are passed through" "-c:v libx264 -crf 20 -preset fast -pix_fmt yuv420p"
+[ "$(grep -c -- '-t 2.5' "$T/ff.log")" = 2 ] && ok "video: -t goes to the decoder and the encoder" || bad "video: -t goes to the decoder and the encoder" "$(grep -c -- '-t 2.5' "$T/ff.log") of 2"
+
+: > "$T/empty.raw"
+rejects "video rejects no arguments"          "usage"                       $B/gl_video_fake
+rejects "video rejects -x 0"                  "usage"                       $B/gl_video_fake -x 0 "$T/v.raw" "$T/vo.raw"
+rejects "video rejects -x 17"                 "usage"                       $B/gl_video_fake -x 17 "$T/v.raw" "$T/vo.raw"
+rejects "video rejects a negative -t"         "usage"                       $B/gl_video_fake -t -1 "$T/v.raw" "$T/vo.raw"
+rejects "video: ffprobe fails"                "cannot read the video stream" $FK FAKE_PROBE_FAIL=1 $B/gl_video_fake "$T/v.raw" "$T/vo.raw"
+rejects "video: ffprobe missing"              "cannot read the video stream" $FK FFPROBE=/no/such/ffprobe $B/gl_video_fake "$T/v.raw" "$T/vo.raw"
+rejects "video: no frames decoded"            "no frames could be decoded"  $FK $B/gl_video_fake "$T/empty.raw" "$T/vo.raw"
+rejects "video: ffmpeg missing"               "no frames could be decoded"  $FK FFMPEG=/no/such/ffmpeg $B/gl_video_fake "$T/v.raw" "$T/vo.raw"
+rejects "video: the encoder fails at once"    "the encoder failed"          $FK FAKE_ENC_FAIL=1 $B/gl_video_fake "$T/v.raw" "$T/vo.raw"
+rejects "video: the encoder fails at the end" "the encoder failed"          $FK FAKE_ENC_FAIL_LATE=1 $B/gl_video_fake "$T/v.raw" "$T/vo.raw"
+# a decoder that dies after producing frames: keep what was decoded, but say so
+if $TO $FK FAKE_DEC_EXIT=3 $B/gl_video_fake -x 2 "$T/v.raw" "$T/vo.raw" >"$T/log" 2>&1 && grep -q "decoder exited with status 3" "$T/log" \
+   && $B/check_video verify "$T/v.raw" "$T/vo.raw" 64 48 2 >/dev/null; then ok "video: a failing decoder gives a warning and the frames so far"
+else bad "video: a failing decoder gives a warning and the frames so far" "$(tail -1 "$T/log")"; fi
+
+if [ -x "$B/gl_video_fake_tsan" ]; then
+  $B/check_video gen "$T/v60.raw" 64 48 60 3
+  racy=0
+  for m in 2 3; do
+    TSAN_OPTIONS=halt_on_error=0 $TO $FK $B/gl_video_fake_tsan -x $m "$T/v60.raw" "$T/vo.raw" >"$T/log" 2>&1 || racy=1
+    grep -q "ThreadSanitizer" "$T/log" && racy=1
+  done
+  if [ $racy -eq 0 ]; then ok "video threading under ThreadSanitizer"; else bad "video threading under ThreadSanitizer" "$(grep -m1 -A3 ThreadSanitizer "$T/log" | tr '\n' ' ')"; fi
+fi
+
+# with a real ffmpeg on PATH: a real video through real encoding, audio copied bit for bit
+if command -v ffmpeg >/dev/null 2>&1 && command -v ffprobe >/dev/null 2>&1; then
+  ffmpeg -v error -y -f lavfi -i "testsrc2=size=64x48:rate=10:duration=1" -f lavfi -i "sine=frequency=440:duration=1" \
+    -c:v ffv1 -pix_fmt yuv420p -c:a flac -shortest "$T/real_in.mkv" >/dev/null 2>&1
+  real_ffmpeg=1
+  if $B/gl_video_fake -x 2 --vcodec ffv1 "$T/real_in.mkv" "$T/real_out.mkv" >"$T/log" 2>&1; then
+    info=$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=r_frame_rate,nb_read_frames -of csv=p=0 "$T/real_out.mkv")
+    a_in=$(ffmpeg -v error -i "$T/real_in.mkv" -map 0:a -f md5 - 2>&1); a_out=$(ffmpeg -v error -i "$T/real_out.mkv" -map 0:a -f md5 - 2>&1)
+    [ "$info" = "20/1,20" ] && [ -n "$a_in" ] && [ "$a_in" = "$a_out" ] && ok "video (real ffmpeg): 10 -> 20 frames at 20 fps, audio copied bit for bit" \
+      || bad "video (real ffmpeg)" "video: $info, audio in/out: $a_in / $a_out"
+  else bad "video (real ffmpeg)" "$(tail -1 "$T/log")"; fi
+else skp "video (real ffmpeg)" "no ffmpeg/ffprobe on PATH"; fi
 
 [ -f "$MODEL/flownet.bin" ] || { echo "SKIP  all end-to-end tests (no model at $MODEL: run ./fetch_model.sh)"; exit 0; }
 
@@ -104,6 +176,16 @@ if [ -z "$gl_unavailable" ]; then
     out1=$($B/pngdiff "$T/p1.png" "$T/o4/00000002.png" 0) && out2=$($B/pngdiff "$T/p2.png" "$T/o4/00000004.png" 0) \
       && ok "dir (gl): in-between frames identical to gl's" || bad "dir (gl): in-between frames" "$out1 | $out2"
   else bad "dir (gl)" "$(tail -1 "$T/log")"; fi
+
+  # gl_video on the GPU with a real ffmpeg: 10 frames -> 20 at double the rate, audio copied
+  if [ -n "$real_ffmpeg" ]; then
+    if $TO $B/gl_video -m "$MODEL" -x 2 --vcodec ffv1 "$T/real_in.mkv" "$T/gl_out.mkv" >"$T/log" 2>&1; then
+      info=$(ffprobe -v error -select_streams v:0 -count_frames -show_entries stream=r_frame_rate,nb_read_frames -of csv=p=0 "$T/gl_out.mkv")
+      a_in=$(ffmpeg -v error -i "$T/real_in.mkv" -map 0:a -f md5 - 2>&1); a_out=$(ffmpeg -v error -i "$T/gl_out.mkv" -map 0:a -f md5 - 2>&1)
+      [ "$info" = "20/1,20" ] && [ -n "$a_in" ] && [ "$a_in" = "$a_out" ] && ok "video (gl + real ffmpeg): 10 -> 20 frames, audio copied" \
+        || bad "video (gl + real ffmpeg)" "video: $info, audio in/out: $a_in / $a_out"
+    else bad "video (gl + real ffmpeg)" "$(tail -1 "$T/log")"; fi
+  fi
 
   # the GL host parses the generic ncnn files: damaged ones must give a clear error (regression: these used to read
   # past the buffer / divide by zero). Only meaningful with a GL context, or it would die earlier for another reason.
