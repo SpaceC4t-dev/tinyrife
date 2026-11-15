@@ -3,18 +3,19 @@
 RIFE v4.6 frame interpolation ([Practical-RIFE](https://github.com/hzwer/Practical-RIFE) weights, via the
 [rife-ncnn-vulkan](https://github.com/nihui/rife-ncnn-vulkan) model files) implemented with **OpenGL 4.3 core compute
 shaders**, fp32 only, no extensions. There are three implementations of the same network: two C programs
-(`src/rife_gl.c` on the GPU, `src/rife_cpu.c` on the CPU with AVX2 + OpenMP, ~3.5x faster than PyTorch) and a Python GL host.
+(GPU: `gl` for a frame pair and `gl_dir` for a PNG sequence, built on the host library `gl_host.c`; CPU: `cpu` with
+AVX2 + OpenMP, ~3.5x faster than PyTorch) and a Python GL host.
 
 ## Layout
 
 ```
-src/          the C programs: rife_cpu.c, rife_gl.c
+src/          the C code: cpu.c; gl_host.{c,h} (GL host library), gl.c (one pair), gl_dir.c (PNG sequence)
 shaders/      GLSL compute shaders (*.comp) shared by both GL hosts; embedded into the C build by embed.sh
 third_party/  stb_image / stb_image_write (vendored)
-python/       optional helpers: GL host, torch reference, tests, benchmarks, video/directory tools
+python/       optional helpers: GL host, torch reference, tests, benchmarks, video tool
 data/         sample frames
 tests/        C unit tests, end-to-end golden tests and their golden images (no Python needed)
-Makefile      builds build/rife_cpu and build/rife_gl; needs only a C compiler, make and sh
+Makefile      builds build/cpu, build/gl and build/gl_dir; needs only a C compiler, make and sh
 ```
 
 Nothing in `src/` or the build depends on Python; `python/` only uses what the C side defines (the shaders, the model).
@@ -23,10 +24,11 @@ Nothing in `src/` or the build depends on Python; `python/` only uses what the C
 
 ```sh
 ./fetch_model.sh                       # model -> ext/ (needed by both programs; add --ncnn-bin for the comparison binary)
-make                                   # build/rife_cpu, build/rife_gl
+make                                   # build/cpu, build/gl, build/gl_dir
 
-build/rife_gl  [-m model_dir] [-t 0.5] [-b N] a.png b.png out.png          # GPU; -b N also times N runs
-build/rife_cpu [--pad 32|64] ext/rife-ncnn-vulkan/models/rife-v4.6/flownet.bin a.png b.png 0.5 out.png [iterations]
+build/gl     [-m model_dir] [-t 0.5] [-b N] a.png b.png out.png   # GPU, one pair; -b N also times N runs
+build/gl_dir [-m model_dir] [-j 4] in_dir out_dir                 # GPU, 2x a PNG sequence (2N-1 frames)
+build/cpu    [--pad 32|64] ext/rife-ncnn-vulkan/models/rife-v4.6/flownet.bin a.png b.png 0.5 out.png [iterations]
 ```
 
 ## Tests
@@ -40,6 +42,9 @@ make test       # kernel unit tests + end-to-end golden tests (model needed for 
 - `tests/run.sh` runs both programs on the frames in `data/` against the images in `tests/golden/` (tolerance 1 uint8 level,
   the project's pass criterion), checks that the CPU and GL outputs agree, and that truncated, padded or wrong model files
   and bad arguments are rejected. The GL cases are skipped, not failed, when there is no OpenGL 4.3 context.
+- `gl_dir` is also built against a fake GL host (`tests/fake_gl_host.c`, "interpolation" = average of the two frames), so its
+  directory handling, error cases and threading are tested exactly and without a GPU; `tests/check_dir.c` verifies the output
+  sequence. On the GPU its frames are compared with `gl`'s for each pair.
 - `python/test_gl.py` is the independent check against the PyTorch reference (needs torch and a GPU).
 
 ### Checking tools
@@ -54,8 +59,16 @@ make tidy       # clang-tidy, if installed (config in .clang-tidy; `pip install 
 `make sanitize` and `make lint` are clean. `make analyze` reports one location-less `-Wanalyzer-use-of-uninitialized-value`
 that I could not trace to a source line. ThreadSanitizer is not usable with libgomp (it reports the fork/join of every
 parallel region as a race); instead the CPU output is byte-identical at 1, 2, 3, 6 and 12 threads and across repeated runs.
+It is also unusable against the real GL driver (it reports Mesa's own threads), so `gl_dir`'s threading is checked with
+TSan against the fake host, where it found (and `make sanitize` now guards against) a use-after-free in the reader thread.
 
-`rife_gl` links nothing: libEGL is `dlopen`ed and GL entry points come from `eglGetProcAddress`. `rife_cpu` is hardcoded
+`gl_dir` turns `in_dir/*.png` (sorted) into `out_dir/%08d.png`: input frame 1, the interpolated frame, input frame 2, ...
+(2N-1 frames). The inputs are copied byte for byte, the in-between frames use fast PNG compression, and every frame is
+decoded once and uploaded once. A reader thread decodes ahead and `-j` writer threads encode and copy behind, so PNG I/O
+overlaps the GPU; all GL calls stay on the main thread. On 24 frames of 1080p it takes 6.4 s and 131 MB peak,
+against 7.0 s and 264 MB for the Python tool it replaces, with identical output (RIFE calls dominate at about 270 ms each).
+
+`gl` links nothing: libEGL is `dlopen`ed and GL entry points come from `eglGetProcAddress`. `cpu` is hardcoded
 to this network (`net_forward()` is the whole pipeline) and checks the `.bin` against the architecture.
 `RIFE_PROFILE=1` prints a per-phase time breakdown. `--pad 64` matches Practical-RIFE's padding.
 
@@ -73,7 +86,6 @@ Runs headless through EGL (`moderngl.create_standalone_context(backend="egl")`).
 ```sh
 python python/gl_rife.py frame0.png frame1.png -o mid.png [-t 0.5]   # single pair
 python python/run_gl_video.py in.webm out.mkv [-m 2] [-t SECONDS]     # video -> video via ffmpeg pipes, audio copied
-python python/run_gl_dir.py inputs/ outputs/                          # 2x a PNG sequence (2N-1 frames)
 ```
 
 ```python
@@ -141,7 +153,7 @@ Streaming end-to-end (upload + interpolate + download, `push` + `interpolate_byt
 
 ## CPU implementation
 
-`src/rife_cpu.c` is the same network on the CPU: 4 IFBlocks (192/128/96/64 channels at 1/8..1/1 scale) refine a flow
+`src/cpu.c` is the same network on the CPU: 4 IFBlocks (192/128/96/64 channels at 1/8..1/1 scale) refine a flow
 field and a blend mask, then a fused warp + blend produces the frame. The residual 3x3 convs run as Winograd
 F(4x4)/F(6x6) in a packed-8 channel layout, the strided convs and the deconv(+PixelShuffle) are direct AVX2/FMA
 kernels, and warp + concat + downscale and the final warp + sigmoid blend are fused.

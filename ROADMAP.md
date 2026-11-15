@@ -12,7 +12,7 @@ On hard cuts RIFE produces a morph / cross-fade (e.g. a colour change plus text 
 Practical-RIFE compares the two frames at low resolution (SSIM threshold) and duplicates a frame instead of interpolating.
 
 - Small GPU reduction over a downscaled frame pair (or reuse block-0 input), threshold configurable.
-- Expose in `run_gl_video.py` / `run_gl_dir.py` (`--scene-thresh`, off = always interpolate).
+- Expose in `run_gl_video.py` / `gl_dir` (`--scene-thresh`, off = always interpolate).
 - ~30 lines.
 
 ## 2. `scale` option for 4K / large motion (speed + quality, small)

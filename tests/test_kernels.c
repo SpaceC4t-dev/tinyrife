@@ -1,7 +1,7 @@
-/* Unit tests for the CPU kernels in src/rife_cpu.c against naive references. No model or image files needed.
+/* Unit tests for the CPU kernels in src/cpu.c against naive references. No model or image files needed.
  * Build/run: make test   (or: gcc -O2 -march=native -fopenmp -Ithird_party tests/test_kernels.c -lm) */
-#define main rife_cpu_main
-#include "../src/rife_cpu.c"
+#define main cpu_main
+#include "../src/cpu.c"
 #undef main
 
 static int g_checks = 0, g_fail = 0;

@@ -3,8 +3,8 @@
  *   Input:  two RGB images (HxWx3, uint8) + timestep in [0,1]
  *   Output: interpolated RGB image (HxWx3, uint8)
  *
- * Build:  make build/rife_cpu
- * Run:    build/rife_cpu [--pad 32|64] ext/rife-ncnn-vulkan/models/rife-v4.6/flownet.bin frame0.png frame1.png 0.5 out.png [iterations]
+ * Build:  make build/cpu
+ * Run:    build/cpu [--pad 32|64] ext/rife-ncnn-vulkan/models/rife-v4.6/flownet.bin frame0.png frame1.png 0.5 out.png [iterations]
  *
  * --pad sets the multiple the frame is zero-padded to (default 32, as in
  * rife-ncnn-vulkan). --pad 64 matches Practical-RIFE's inference scripts.

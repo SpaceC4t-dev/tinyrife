@@ -1,11 +1,7 @@
-/* RIFE v4.6 frame interpolation on OpenGL 4.3 compute shaders, host side in C.
+/* RIFE v4.6 on OpenGL 4.3 compute shaders: the host side as a small library (API in gl_host.h).
  *
- * Same shaders and buffer layout as the GLSL in shaders/ (embedded at build time as build/shaders.h). No GL/EGL headers or link-time
- * dependencies: libEGL is dlopen()ed and every GL entry point comes from eglGetProcAddress.
- *
- * Build:  make build/rife_gl
- * Usage:  build/rife_gl [-m model_dir] [-t timestep] [-b N] frame0.png frame1.png out.png
- *         (model_dir holds flownet.param/.bin; -b N additionally times N GPU runs)
+ * Same shaders and buffer layout as the GLSL in shaders/ (embedded at build time as build/shaders.h). No GL/EGL headers or
+ * link-time dependencies: libEGL is dlopen()ed and every GL entry point comes from eglGetProcAddress.
  */
 #include <dlfcn.h>
 #include <math.h>
@@ -14,15 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
-#define STB_IMAGE_IMPLEMENTATION
-#define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "stb_image.h"
-#include "stb_image_write.h"
+#include "gl_host.h"
 #include "shaders.h"
-
-#define DEFAULT_MODEL "ext/rife-ncnn-vulkan/models/rife-v4.6"
 
 /* ------------------------------------------------------------------ minimal EGL / GL declarations */
 
@@ -77,8 +67,7 @@ typedef uint64_t GLuint64;
 GL_FUNCS(X)
 #undef X
 
-static void die(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
-static void die(const char *fmt, ...) {
+void rife_die(const char *fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
   vfprintf(stderr, fmt, ap);
@@ -90,9 +79,9 @@ static void die(const char *fmt, ...) {
 static struct { EGLDisplay dpy; EGLContext ctx; EGLBoolean (*make_current)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
                 EGLBoolean (*destroy_context)(EGLDisplay, EGLContext); EGLBoolean (*terminate)(EGLDisplay); } g_egl;
 
-static void gl_init(void) {
+void gl_init(void) {
   void *lib = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
-  if (!lib) die("cannot load libEGL.so.1");
+  if (!lib) rife_die("cannot load libEGL.so.1");
   EGLDisplay (*getDisplay)(void *) = dlsym(lib, "eglGetDisplay");
   EGLBoolean (*initialize)(EGLDisplay, EGLint *, EGLint *) = dlsym(lib, "eglInitialize");
   EGLBoolean (*bindAPI)(EGLenum) = dlsym(lib, "eglBindAPI");
@@ -103,31 +92,31 @@ static void gl_init(void) {
   EGLBoolean (*destroyContext)(EGLDisplay, EGLContext) = dlsym(lib, "eglDestroyContext");
   EGLBoolean (*terminate)(EGLDisplay) = dlsym(lib, "eglTerminate");
   if (!getDisplay || !initialize || !bindAPI || !chooseConfig || !createContext || !makeCurrent || !getProc)
-    die("libEGL is missing required entry points");
+    rife_die("libEGL is missing required entry points");
 
   EGLDisplay dpy = getDisplay(NULL);
   EGLint maj, min;
-  if (!dpy || !initialize(dpy, &maj, &min)) die("eglInitialize failed");
-  if (!bindAPI(EGL_OPENGL_API)) die("eglBindAPI(OpenGL) failed");
+  if (!dpy || !initialize(dpy, &maj, &min)) rife_die("eglInitialize failed");
+  if (!bindAPI(EGL_OPENGL_API)) rife_die("eglBindAPI(OpenGL) failed");
   const EGLint cfg_attr[] = {EGL_SURFACE_TYPE, EGL_PBUFFER_BIT, EGL_RENDERABLE_TYPE, EGL_OPENGL_BIT, EGL_NONE};
   EGLConfig cfg;
   EGLint n = 0;
-  if (!chooseConfig(dpy, cfg_attr, &cfg, 1, &n) || n < 1) die("no EGL config");
+  if (!chooseConfig(dpy, cfg_attr, &cfg, 1, &n) || n < 1) rife_die("no EGL config");
   const EGLint ctx_attr[] = {EGL_CONTEXT_MAJOR_VERSION, 4, EGL_CONTEXT_MINOR_VERSION, 3,
                              EGL_CONTEXT_OPENGL_PROFILE_MASK, EGL_CONTEXT_OPENGL_CORE_PROFILE_BIT, EGL_NONE};
   EGLContext ctx = createContext(dpy, cfg, NULL, ctx_attr);
-  if (!ctx) die("cannot create an OpenGL 4.3 core context");
-  if (!makeCurrent(dpy, NULL, NULL, ctx)) die("eglMakeCurrent failed");
+  if (!ctx) rife_die("cannot create an OpenGL 4.3 core context");
+  if (!makeCurrent(dpy, NULL, NULL, ctx)) rife_die("eglMakeCurrent failed");
   g_egl.dpy = dpy, g_egl.ctx = ctx, g_egl.make_current = makeCurrent, g_egl.destroy_context = destroyContext, g_egl.terminate = terminate;
 
 #define X(ret, name, args)                                                                                             \
-  if (!(gl##name = (ret(*) args)getProc("gl" #name))) die("missing GL function gl" #name);
+  if (!(gl##name = (ret(*) args)getProc("gl" #name))) rife_die("missing GL function gl" #name);
   GL_FUNCS(X)
 #undef X
 }
 
 /* Release the context so the driver frees its own state (all GL objects go with it). */
-static void gl_shutdown(void) {
+void gl_shutdown(void) {
   if (!g_egl.dpy) return;
   g_egl.make_current(g_egl.dpy, NULL, NULL, NULL);
   if (g_egl.destroy_context) g_egl.destroy_context(g_egl.dpy, g_egl.ctx);
@@ -146,14 +135,14 @@ typedef struct {
 
 static void *slurp(const char *path, size_t *len) {
   FILE *f = fopen(path, "rb");
-  if (!f) die("cannot open %s", path);
+  if (!f) rife_die("cannot open %s", path);
   fseek(f, 0, SEEK_END);
   long n = ftell(f);
-  if (n < 0) die("cannot determine the size of %s", path);
+  if (n < 0) rife_die("cannot determine the size of %s", path);
   fseek(f, 0, SEEK_SET);
   void *p = malloc((size_t)n + 1);
-  if (!p) die("out of memory reading %s", path);
-  if (fread(p, 1, n, f) != (size_t)n) die("short read on %s", path);
+  if (!p) rife_die("out of memory reading %s", path);
+  if (fread(p, 1, n, f) != (size_t)n) rife_die("short read on %s", path);
   // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound) p has n+1 bytes (n checked >= 0 above)
   ((char *)p)[n] = 0;
   fclose(f);
@@ -175,7 +164,7 @@ static void load_ncnn(const char *dir, Layer *L) {
   snprintf(path, sizeof path, "%s/flownet.bin", dir);
   size_t blen;
   uint8_t *blob = slurp(path, &blen);
-  if (strncmp(param, "7767517", 7) != 0) die("not an ncnn param file");
+  if (strncmp(param, "7767517", 7) != 0) rife_die("not an ncnn param file");
   size_t off = 0;
   int nl = 0;
   char *save;
@@ -202,13 +191,13 @@ static void load_ncnn(const char *dir, Layer *L) {
       if (key == 6) wsize = val;
     }
     if (outc <= 0 || k <= 0 || wsize <= 0 || wsize > (1L << 28) || wsize % ((long)outc * k * k))
-      die("%s: bad convolution parameters in %s/flownet.param", name, dir);
-    if (nl >= N_LAYERS) die("unexpected layer count in %s (expected %d conv layers)", dir, N_LAYERS);
+      rife_die("%s: bad convolution parameters in %s/flownet.param", name, dir);
+    if (nl >= N_LAYERS) rife_die("unexpected layer count in %s (expected %d conv layers)", dir, N_LAYERS);
     Layer *l = &L[nl++];
     l->outc = outc, l->k = k, l->inc = (int)(wsize / ((long)outc * k * k));
     l->w = malloc((size_t)wsize * sizeof(float));
-    if (!l->w) die("out of memory");
-#define NEED(n) do { if ((size_t)(n) > blen - off) die("%s: truncated weights in %s/flownet.bin", name, dir); } while (0)
+    if (!l->w) rife_die("out of memory");
+#define NEED(n) do { if ((size_t)(n) > blen - off) rife_die("%s: truncated weights in %s/flownet.bin", name, dir); } while (0)
     uint32_t tag;
     NEED(4);
     memcpy(&tag, blob + off, 4), off += 4;
@@ -224,7 +213,7 @@ static void load_ncnn(const char *dir, Layer *L) {
       NEED((size_t)wsize * 4);
       memcpy(l->w, blob + off, (size_t)wsize * 4), off += (size_t)wsize * 4;
     } else {
-      die("%s: unsupported weight tag 0x%x", name, tag);
+      rife_die("%s: unsupported weight tag 0x%x", name, tag);
     }
     l->b = calloc(outc, sizeof(float));
     if (has_bias) {
@@ -233,8 +222,8 @@ static void load_ncnn(const char *dir, Layer *L) {
     }
 #undef NEED
   }
-  if (nl != N_LAYERS) die("found %d conv layers, expected %d", nl, N_LAYERS);
-  if (off != blen) die("consumed %zu of %zu weight bytes -- layout mismatch", off, blen);
+  if (nl != N_LAYERS) rife_die("found %d conv layers, expected %d", nl, N_LAYERS);
+  if (off != blen) rife_die("consumed %zu of %zu weight bytes -- layout mismatch", off, blen);
   free(param);
   free(blob);
 }
@@ -261,7 +250,7 @@ typedef struct {
 #define MAX_STEPS 256
 #define MAX_PROGS 128
 
-typedef struct {
+struct Rife {
   int h, w, H, W; /* image and padded size */
   size_t nbytes;
   GLuint img[3], out, raw_in, raw_out, flow, mask; /* img[]: 2 live frames + 1 spare, rotated by push() */
@@ -271,16 +260,17 @@ typedef struct {
   GLuint unpack, pack;
   struct { char *src; GLuint prog; } progs[MAX_PROGS]; /* compiled programs, keyed by their full source */
   int nprogs;
-} Rife;
+  GLuint query; /* timer query, created on first rife_gpu_ms() */
+};
 
 /* Compile `body` with "#define NAME value" lines for each name/value pair (NULL-terminated). */
 static GLuint get_prog(Rife *r, const char *body, const char *const *defs, const int *vals) {
   size_t blen = strlen(body), cap = blen + 64 * 32, used = 0;
   char *src = malloc(cap);
-  if (!src) die("out of memory");
+  if (!src) rife_die("out of memory");
   used += (size_t)snprintf(src, cap, "#version 430\n#define W %d\n#define H %d\n", r->W, r->H);
   for (int i = 0; defs[i] && used < cap; i++) used += (size_t)snprintf(src + used, cap - used, "#define %s %d\n", defs[i], vals[i]);
-  if (used + blen + 1 > cap) die("shader source buffer too small");
+  if (used + blen + 1 > cap) rife_die("shader source buffer too small");
   memcpy(src + used, body, blen + 1);
   for (int i = 0; i < r->nprogs; i++)
     if (!strcmp(r->progs[i].src, src)) { free(src); return r->progs[i].prog; }
@@ -292,7 +282,7 @@ static GLuint get_prog(Rife *r, const char *body, const char *const *defs, const
   if (!ok) {
     char log[4096];
     glGetShaderInfoLog(sh, sizeof log, NULL, log);
-    die("shader compile failed:\n%s", log);
+    rife_die("shader compile failed:\n%s", log);
   }
   GLuint prog = glCreateProgram();
   glAttachShader(prog, sh);
@@ -301,10 +291,10 @@ static GLuint get_prog(Rife *r, const char *body, const char *const *defs, const
   if (!ok) {
     char log[4096];
     glGetProgramInfoLog(prog, sizeof log, NULL, log);
-    die("shader link failed:\n%s", log);
+    rife_die("shader link failed:\n%s", log);
   }
   glDeleteShader(sh);
-  if (r->nprogs >= MAX_PROGS) die("program cache full");
+  if (r->nprogs >= MAX_PROGS) rife_die("program cache full");
   r->progs[r->nprogs].src = src;
   r->progs[r->nprogs++].prog = prog;
   return prog;
@@ -314,7 +304,7 @@ static GLuint get_prog(Rife *r, const char *body, const char *const *defs, const
 #define VALS(...) ((const int[]){__VA_ARGS__})
 
 static Step *add_step(Rife *r, GLuint prog, unsigned gx, unsigned gy, unsigned gz) {
-  if (r->nsteps >= MAX_STEPS) die("too many steps");
+  if (r->nsteps >= MAX_STEPS) rife_die("too many steps");
   Step *s = &r->steps[r->nsteps++];
   memset(s, 0, sizeof *s);
   s->prog = prog, s->groups[0] = gx, s->groups[1] = gy, s->groups[2] = gz;
@@ -368,11 +358,13 @@ static void add_conv(Rife *r, GLuint in, const Layer *l, GLuint out, int ic4, in
   s->buf[0] = in, s->buf[1] = wbuf, s->buf[2] = bbuf, s->buf[3] = out;
 }
 
-static Rife *rife_new(int h, int w, const char *model_dir) {
+Rife *rife_new(int h, int w, const char *model_dir) {
   Rife *r = calloc(1, sizeof *r);
+  if (!r) rife_die("out of memory");
   r->h = h, r->w = w, r->H = cdiv(h, 32) * 32, r->W = cdiv(w, 32) * 32;
   int H = r->H, W = r->W;
   Layer *L = calloc(N_LAYERS, sizeof(Layer));
+  if (!L) rife_die("out of memory");
   load_ncnn(model_dir, L);
 
   for (int i = 0; i < 3; i++) r->img[i] = make_buffer((size_t)H * W * 4, NULL);
@@ -428,7 +420,7 @@ static Rife *rife_new(int h, int w, const char *model_dir) {
 }
 
 /* Host-side memory only; GL buffers and programs go away with the context at process exit. */
-static void rife_free(Rife *r) {
+void rife_free(Rife *r) {
   for (int i = 0; i < r->nprogs; i++) free(r->progs[i].src);
   free(r);
 }
@@ -436,7 +428,7 @@ static void rife_free(Rife *r) {
 /* ------------------------------------------------------------------ runtime */
 
 /* Upload the next frame (tight RGB24). Interpolation runs between the last two pushed frames. */
-static void rife_push(Rife *r, const uint8_t *rgb) {
+void rife_push(Rife *r, const uint8_t *rgb) {
   int dst = 3 - r->prev - r->last; /* the spare slot becomes the newest frame */
   glBindBuffer(GL_SHADER_STORAGE_BUFFER, r->raw_in);
   glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)r->nbytes, rgb);
@@ -466,8 +458,8 @@ static void rife_run(Rife *r, float timestep) {
 }
 
 /* Interpolated frame between the last two pushed frames, as tight RGB24. */
-static void rife_interpolate(Rife *r, float timestep, uint8_t *rgb_out) {
-  if (r->count < 2) die("push two frames first");
+void rife_interpolate(Rife *r, float timestep, uint8_t *rgb_out) {
+  if (r->count < 2) rife_die("push two frames first");
   rife_run(r, timestep);
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, r->out);
   glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, r->raw_out);
@@ -478,71 +470,19 @@ static void rife_interpolate(Rife *r, float timestep, uint8_t *rgb_out) {
   glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)r->nbytes, rgb_out);
 }
 
-/* ------------------------------------------------------------------ CLI */
-
-static double now_ms(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+/* GPU time of one interpolation between the last two pushed frames, from a timer query. */
+double rife_gpu_ms(Rife *r, float timestep) {
+  if (!r->query) glGenQueries(1, &r->query);
+  glBeginQuery(GL_TIME_ELAPSED, r->query);
+  rife_run(r, timestep);
+  glEndQuery(GL_TIME_ELAPSED);
+  GLuint64 ns;
+  glGetQueryObjectui64v(r->query, GL_QUERY_RESULT, &ns);
+  return (double)ns / 1e6;
 }
 
-static int cmp_d(const void *a, const void *b) { return (*(double *)a > *(double *)b) - (*(double *)a < *(double *)b); }
+size_t rife_frame_bytes(const Rife *r) { return r->nbytes; }
 
-int main(int argc, char **argv) {
-  const char *model = DEFAULT_MODEL, *pos[3];
-  float timestep = 0.5f;
-  int bench = 0, np = 0;
-  for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
-    else if (!strcmp(argv[i], "-t") && i + 1 < argc) timestep = (float)atof(argv[++i]);
-    else if (!strcmp(argv[i], "-b") && i + 1 < argc) bench = atoi(argv[++i]);
-    else if (np < 3) pos[np++] = argv[i];
-    else np = 4;
-  }
-  if (np != 3) die("usage: %s [-m model_dir] [-t timestep] [-b N] frame0.png frame1.png out.png", argv[0]);
+void rife_padded_size(const Rife *r, int *W, int *H) { *W = r->W, *H = r->H; }
 
-  int w, h, w1, h1, c;
-  uint8_t *a = stbi_load(pos[0], &w, &h, &c, 3), *b = stbi_load(pos[1], &w1, &h1, &c, 3);
-  if (!a || !b) die("cannot read input images");
-  if (w != w1 || h != h1) die("frame sizes differ: %dx%d vs %dx%d", w, h, w1, h1);
-
-  gl_init();
-  fprintf(stderr, "GL renderer: %s\n", (const char *)glGetString(GL_RENDERER));
-  Rife *r = rife_new(h, w, model);
-  uint8_t *out = malloc(r->nbytes);
-  rife_push(r, a);
-  rife_push(r, b);
-  rife_interpolate(r, timestep, out);
-  if (!stbi_write_png(pos[2], w, h, 3, out, w * 3)) die("cannot write %s", pos[2]);
-  printf("wrote %s\n", pos[2]);
-
-  if (bench > 0) {
-    GLuint q;
-    glGenQueries(1, &q);
-    double *gpu = malloc(bench * sizeof(double));
-    for (int i = 0; i < bench; i++) {
-      glBeginQuery(GL_TIME_ELAPSED, q);
-      rife_run(r, timestep);
-      glEndQuery(GL_TIME_ELAPSED);
-      GLuint64 ns;
-      glGetQueryObjectui64v(q, GL_QUERY_RESULT, &ns);
-      gpu[i] = ns / 1e6;
-    }
-    qsort(gpu, bench, sizeof(double), cmp_d);
-    double t0 = now_ms();
-    for (int i = 0; i < bench; i++) {
-      rife_push(r, i & 1 ? a : b);
-      rife_interpolate(r, timestep, out);
-    }
-    double e2e = (now_ms() - t0) / bench;
-    printf("GL(C) %dx%d (padded %dx%d): gpu %.1f ms (%.2f fps) | end-to-end %.1f ms (%.2f fps)\n", w, h, r->W, r->H,
-           gpu[bench / 2], 1e3 / gpu[bench / 2], e2e, 1e3 / e2e);
-    free(gpu);
-  }
-  free(out);
-  rife_free(r);
-  gl_shutdown();
-  stbi_image_free(a);
-  stbi_image_free(b);
-  return 0;
-}
+const char *gl_renderer(void) { return (const char *)glGetString(GL_RENDERER); }
