@@ -74,9 +74,17 @@ static void tensor_free(Tensor* t) {
     }
 }
 
-/* Persistent padding workspace for all convolutions */
-#define PIN_SCRATCH_SIZE (8 * 1024 * 1024)
+/* Persistent workspace shared by conv input padding and deconv HWC reordering.
+ * Sized in main() from the inferred blob shapes (in floats). */
 static float* g_pin_scratch = NULL;
+static size_t g_pin_scratch_size = 0;
+
+static void scratch_check(size_t need, const char* who) {
+    if (need > g_pin_scratch_size) {
+        fprintf(stderr, "%s: scratch too small (%zu > %zu floats)\n", who, need, g_pin_scratch_size);
+        abort();
+    }
+}
 double s1_time = 0, s2_time = 0, pad_time = 0;
 double s1_8_time = 0, s1_16_time = 0, s1_32_time = 0, s1_64_time = 0;
 
@@ -433,6 +441,76 @@ static inline __m256 apply_act(__m256 acc, int act_type, __m256 vslope, __m256 v
     return acc;
 }
 
+/* Generic 3x3 stride-1 conv over output channels [oc_begin, oc_end) and output
+ * columns [ow_begin, OW). Handles any width (masked 8-wide tails) and any channel
+ * count (2 OC at a time, odd last channel on its own). Used for the edges the
+ * register-tiled paths below don't cover. */
+static void conv_s1_tail(const Layer* L, const float* pin, const Tensor* res, Tensor* out,
+                         int W, int H, int C, int oc_begin, int oc_end, int ow_begin) {
+    int OW = out->w, OH = out->h;
+    if (oc_begin >= oc_end || ow_begin >= OW) return;
+    int PW = W + 2, PH = H + 2;
+    const float* wt = L->weights;
+    const float* B = L->bias;
+    int act_type = L->act_type;
+    __m256 vslope = _mm256_set1_ps(L->act_params[0]);
+    __m256 vzero = _mm256_setzero_ps();
+    const __m256i lane = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+
+    int out_pw = out->is_padded ? (OW + 2) : OW;
+    size_t out_ch_sz = (size_t)out_pw * (out->is_padded ? (OH + 2) : OH);
+    int out_col_base = out->is_padded ? 1 : 0;
+
+    int res_pw = (res && res->is_padded) ? (OW + 2) : OW;
+    size_t res_ch_sz = (res && res->is_padded) ? (size_t)res_pw * (OH + 2) : (size_t)OW * OH;
+    int res_col_base = (res && res->is_padded) ? 1 : 0;
+
+    int n_pairs = (oc_end - oc_begin + 1) / 2;
+
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int p = 0; p < n_pairs; p++) {
+        for (int oh = 0; oh < OH; oh++) {
+            int oc0 = oc_begin + 2 * p;
+            int has1 = (oc0 + 1) < oc_end;
+            int oc1 = has1 ? oc0 + 1 : oc0;
+            const float* wt0 = wt + (size_t)oc0 * C * 9;
+            const float* wt1 = wt + (size_t)oc1 * C * 9;
+            __m256 vbias0 = _mm256_set1_ps(B ? B[oc0] : 0.0f);
+            __m256 vbias1 = _mm256_set1_ps(B ? B[oc1] : 0.0f);
+            size_t out_row_off = (size_t)(out->is_padded ? (oh + 1) : oh) * out_pw + out_col_base;
+            size_t res_row_off = (size_t)((res && res->is_padded) ? (oh + 1) : oh) * res_pw + res_col_base;
+            float* out_row0 = out->data + (size_t)oc0 * out_ch_sz + out_row_off;
+            float* out_row1 = out->data + (size_t)oc1 * out_ch_sz + out_row_off;
+
+            for (int ow = ow_begin; ow < OW; ow += 8) {
+                int n = OW - ow < 8 ? OW - ow : 8;
+                __m256i mask = _mm256_cmpgt_epi32(_mm256_set1_epi32(n), lane);
+                __m256 a0 = vbias0, a1 = vbias1;
+
+                for (int c = 0; c < C; c++) {
+                    const float* pin_c = pin + (size_t)c * PH * PW + ow;
+                    const float* w0 = wt0 + c * 9;
+                    const float* w1 = wt1 + c * 9;
+                    for (int ky = 0; ky < 3; ky++) {
+                        const float* r = pin_c + (size_t)(oh + ky) * PW;
+                        for (int kx = 0; kx < 3; kx++) {
+                            __m256 in = _mm256_maskload_ps(r + kx, mask);
+                            a0 = _mm256_fmadd_ps(in, _mm256_set1_ps(w0[ky * 3 + kx]), a0);
+                            a1 = _mm256_fmadd_ps(in, _mm256_set1_ps(w1[ky * 3 + kx]), a1);
+                        }
+                    }
+                }
+                if (res) {
+                    a0 = _mm256_add_ps(a0, _mm256_maskload_ps(res->data + (size_t)oc0 * res_ch_sz + res_row_off + ow, mask));
+                    a1 = _mm256_add_ps(a1, _mm256_maskload_ps(res->data + (size_t)oc1 * res_ch_sz + res_row_off + ow, mask));
+                }
+                _mm256_maskstore_ps(out_row0 + ow, mask, apply_act(a0, act_type, vslope, vzero));
+                if (has1) _mm256_maskstore_ps(out_row1 + ow, mask, apply_act(a1, act_type, vslope, vzero));
+            }
+        }
+    }
+}
+
 static void conv_s1_forward(const Layer* L, const float* pin, const Tensor* res, Tensor* out, int in_w, int in_h, int in_c) {
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -526,6 +604,7 @@ static void conv_s1_forward(const Layer* L, const float* pin, const Tensor* res,
                 _mm256_storeu_ps(out3 + out_row_off, a3);
             }
         }
+        conv_s1_tail(L, pin, res, out, W, H, C, OC - OC % 4, OC, 0);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         s1_8_time += (t1.tv_sec - t0.tv_sec)*1000.0 + (t1.tv_nsec - t0.tv_nsec)*1e-6;
         return;
@@ -621,6 +700,7 @@ static void conv_s1_forward(const Layer* L, const float* pin, const Tensor* res,
                 _mm256_storeu_ps(out3 + out_row_off + 0, a0_3); _mm256_storeu_ps(out3 + out_row_off + 8, a1_3);
             }
         }
+        conv_s1_tail(L, pin, res, out, W, H, C, OC - OC % 4, OC, 0);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         s1_16_time += (t1.tv_sec - t0.tv_sec)*1000.0 + (t1.tv_nsec - t0.tv_nsec)*1e-6;
         return;
@@ -742,6 +822,7 @@ static void conv_s1_forward(const Layer* L, const float* pin, const Tensor* res,
                 _mm256_storeu_ps(out_row2 + 24, a3_2);
             }
         }
+        conv_s1_tail(L, pin, res, out, W, H, C, OC - OC % 3, OC, 0);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         s1_32_time += (t1.tv_sec - t0.tv_sec)*1000.0 + (t1.tv_nsec - t0.tv_nsec)*1e-6;
         return;
@@ -847,6 +928,7 @@ static void conv_s1_forward(const Layer* L, const float* pin, const Tensor* res,
                 }
             }
         }
+        conv_s1_tail(L, pin, res, out, W, H, C, OC - OC % 4, OC, 0);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         s1_64_time += (t1.tv_sec - t0.tv_sec)*1000.0 + (t1.tv_nsec - t0.tv_nsec)*1e-6;
         return;
@@ -942,6 +1024,10 @@ static void conv_s1_forward(const Layer* L, const float* pin, const Tensor* res,
             }
         }
     }
+    /* Columns past the last full 32-wide tile, for the paired channels */
+    conv_s1_tail(L, pin, res, out, W, H, C, 0, OC - OC % 2, OW - OW % 32);
+    /* Odd last channel, all columns */
+    conv_s1_tail(L, pin, res, out, W, H, C, OC - OC % 2, OC, 0);
 }
 
 static void conv_s2_forward(const Layer* L, const float* pin, Tensor* out, int in_w, int in_h, int in_c) {
@@ -1075,7 +1161,7 @@ static void conv_forward(const Layer* L, const Tensor* in, const Tensor* res, Te
         pin = in->data;
     } else {
         size_t total_pin = (size_t)C * PH * PW;
-        assert(total_pin <= PIN_SCRATCH_SIZE);
+        scratch_check(total_pin, L->name);
         pin = g_pin_scratch;
 
         #pragma omp parallel for collapse(2) schedule(static)
@@ -1128,6 +1214,7 @@ static void deconv_forward(const Layer* L, const Tensor* in, Tensor* out) {
     }
     const float* wt_reord = L->weights;
     const float* B = L->bias;
+    scratch_check((size_t)H * W * C, L->name);
     float* in_hwc = g_pin_scratch;
 
     if (in->is_padded) {
@@ -2013,10 +2100,6 @@ int main(int argc, char** argv) {
     fuse_resblocks(&g);
     fuse_deconv_pixelshuffle(&g);
 
-    // Allocate persistent padding workspace
-    g_pin_scratch = (float*)aligned_alloc(64, PIN_SCRATCH_SIZE * sizeof(float));
-    assert(g_pin_scratch != NULL);
-
     int w, h;
     Tensor img0 = load_image_rgb(img0_path, &w, &h);
     Tensor img1 = load_image_rgb(img1_path, &w, &h);
@@ -2176,6 +2259,28 @@ int main(int argc, char** argv) {
             blobs[i].data = blobs[root].data + total_off;
             blobs[i].is_padded = blobs[root].is_padded;
         }
+    }
+
+    // Size the shared workspace for the largest user: an unpadded conv input
+    // copied into a zero-bordered buffer, or a deconv input reordered to HWC.
+    size_t scratch_need = 0;
+    for (int i = 0; i < g.n_layers; i++) {
+        const Layer* L = &g.layers[i];
+        const Tensor* in = &blobs[L->in_idx[0]];
+        size_t need = 0;
+        if (L->type == LT_CONV && !in->is_padded) {
+            need = (size_t)in->c * (in->h + 2) * (in->w + 2);
+        } else if (L->type == LT_DECONV) {
+            need = (size_t)in->c * in->h * in->w;
+        }
+        if (need > scratch_need) scratch_need = need;
+    }
+    g_pin_scratch_size = scratch_need;
+    size_t scratch_bytes = (scratch_need * sizeof(float) + 63) & ~(size_t)63;
+    g_pin_scratch = (float*)aligned_alloc(64, scratch_bytes ? scratch_bytes : 64);
+    if (!g_pin_scratch) {
+        fprintf(stderr, "Failed to allocate %zu-byte workspace\n", scratch_bytes);
+        return 1;
     }
 
     // Copy padded inputs
