@@ -21,6 +21,7 @@
 #include <assert.h>
 #include <float.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <immintrin.h>
 
@@ -1921,6 +1922,108 @@ static void warp_forward(const Tensor* img, const Tensor* flow, Tensor* out) {
     }
 }
 
+/* =====================  CACHE SIZES  ===================== */
+/*
+ * The Winograd scheduling heuristics are expressed in terms of the cache
+ * hierarchy, read once at startup: Linux sysfs first (it also says how many
+ * CPUs share an L3, so the total L3 of multi-CCX parts is right), then glibc
+ * sysconf, then defaults matching the Zen 2 part the heuristics were tuned on.
+ */
+typedef struct {
+    size_t l2;         /* per core */
+    size_t l3_slice;   /* one L3 instance (e.g. one CCX on AMD) */
+    size_t l3_total;   /* all L3 instances */
+} CacheInfo;
+
+static CacheInfo g_cache = { 512u << 10, 4u << 20, 8u << 20 };
+
+static int read_line(const char* path, char* buf, size_t n) {
+    FILE* f = fopen(path, "r");
+    if (!f) return 0;
+    int ok = fgets(buf, (int)n, f) != NULL;
+    fclose(f);
+    return ok;
+}
+
+/* "512K", "4096K", "32M" -> bytes */
+static size_t parse_size(const char* s) {
+    char* end;
+    double v = strtod(s, &end);
+    if (*end == 'K' || *end == 'k') v *= 1024;
+    else if (*end == 'M' || *end == 'm') v *= 1024 * 1024;
+    else if (*end == 'G' || *end == 'g') v *= 1024.0 * 1024 * 1024;
+    return v > 0 ? (size_t)v : 0;
+}
+
+/* "0-2,6-8" -> 6 */
+static int count_cpu_list(const char* s) {
+    int n = 0;
+    while (*s && *s != '\n') {
+        char* end;
+        long a = strtol(s, &end, 10), b = a;
+        if (end == s) break;
+        s = end;
+        if (*s == '-') { b = strtol(s + 1, &end, 10); s = end; }
+        n += (int)(b - a + 1);
+        if (*s == ',') s++;
+    }
+    return n;
+}
+
+static void detect_caches(void) {
+    size_t l2 = 0, l3 = 0;
+    int l3_cpus = 0;
+#ifdef __linux__
+    for (int i = 0; i < 16; i++) {
+        char path[128], buf[256];
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/level", i);
+        if (!read_line(path, buf, sizeof(buf))) break;
+        int level = atoi(buf);
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/type", i);
+        if (!read_line(path, buf, sizeof(buf)) || !strncmp(buf, "Instruction", 11)) continue;
+        snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/size", i);
+        if (!read_line(path, buf, sizeof(buf))) continue;
+        size_t sz = parse_size(buf);
+        if (level == 2) l2 = sz;
+        if (level == 3) {
+            l3 = sz;
+            snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu0/cache/index%d/shared_cpu_list", i);
+            if (read_line(path, buf, sizeof(buf))) l3_cpus = count_cpu_list(buf);
+        }
+    }
+#endif
+#ifdef _SC_LEVEL2_CACHE_SIZE
+    if (!l2) { long v = sysconf(_SC_LEVEL2_CACHE_SIZE); if (v > 0) l2 = (size_t)v; }
+#endif
+#ifdef _SC_LEVEL3_CACHE_SIZE
+    if (!l3) { long v = sysconf(_SC_LEVEL3_CACHE_SIZE); if (v > 0) l3 = (size_t)v; }
+#endif
+    if (l2) g_cache.l2 = l2;
+    if (l3) {
+        g_cache.l3_slice = l3;
+        long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        int slices = (l3_cpus > 0 && ncpu > l3_cpus) ? (int)(ncpu / l3_cpus) : 1;
+        g_cache.l3_total = l3 * slices;
+    } else if (l2) {
+        /* no L3 reported (some small cores): budget against L2 alone */
+        g_cache.l3_slice = g_cache.l3_total = l2;
+    }
+    /* RIFE_CACHE=L2,L3slice,L3total (e.g. 1M,32M,32M) overrides detection */
+    const char* ov = getenv("RIFE_CACHE");
+    if (ov) {
+        char buf[128];
+        strncpy(buf, ov, sizeof(buf) - 1); buf[sizeof(buf) - 1] = 0;
+        char* a = strtok(buf, ","); char* b = a ? strtok(NULL, ",") : NULL; char* c = b ? strtok(NULL, ",") : NULL;
+        if (a && b && c && parse_size(a) && parse_size(b) && parse_size(c) >= parse_size(b)) {
+            g_cache.l2 = parse_size(a); g_cache.l3_slice = parse_size(b); g_cache.l3_total = parse_size(c);
+        } else {
+            fprintf(stderr, "RIFE_CACHE must be L2,L3slice,L3total (e.g. 1M,32M,32M); ignored\n");
+        }
+    }
+    printf("Caches: L2 %zu KB/core, L3 %zu KB x %zu (%zu KB total)\n", g_cache.l2 >> 10,
+           g_cache.l3_slice >> 10, g_cache.l3_total / g_cache.l3_slice, g_cache.l3_total >> 10);
+}
+
 /* =====================  FUSED IFBLOCK (packed-8 layout)  ===================== */
 /*
  * One RIFE IFBlock = conv3x3s2+lrelu, conv3x3s2+lrelu, 8 x (conv3x3 + x, lrelu),
@@ -2419,10 +2522,12 @@ static void ifblock_prepare(IFBlock* B, int in_w, int in_h) {
     p8_alloc(&B->y, B->c, H2, W2);
 
     int C = B->c, nob = C / 16;
-    /* F(6x6) needs 64/36 = 1.8x the weight memory of F(4x4): it wins on the
-     * narrow, high-resolution blocks (<= 96 ch) and loses on the wide ones,
-     * whose weights then no longer fit the cache budget (measured on Zen 2). */
-    B->m = C <= 96 ? 6 : 4;
+    /* F(6x6) needs 21% fewer FLOPs but 64/36 = 1.8x the weight memory of
+     * F(4x4). Use it while its weights stay well inside one L3 slice; on Zen 2
+     * (4 MB slices) this picks F(6x6) for <= 96 ch, which measured faster, and
+     * F(4x4) for 128/192 ch, where F(6x6) measured slower. */
+    size_t u6 = (size_t)64 * C * C * sizeof(float);
+    B->m = u6 * 10 <= g_cache.l3_slice * 6 ? 6 : 4;
     const char* tenv = getenv("RIFE_WINO_TILE");
     if (tenv) B->m = atoi(tenv) == 4 ? 4 : 6;
     B->K = (B->m + 2) * (B->m + 2);
@@ -2430,20 +2535,22 @@ static void ifblock_prepare(IFBlock* B, int in_w, int in_h) {
     for (int i = 0; i < 8; i++) B->U[i] = wino_weights(B->res[i].weights, C, C, m);
     int T = ((H2 + m - 1) / m) * ((W2 + m - 1) / m), NG = (T + 5) / 6;
     size_t act_bytes = (size_t)C * B->x.PH * B->x.PW * sizeof(float);
-    B->nt_out = act_bytes > (8u << 20);     /* well beyond L3 (2 x 4 MB on Zen 2) */
+    B->nt_out = act_bytes > g_cache.l3_total;   /* can't stay cached anyway: skip the RFO */
     const char* nenv = getenv("RIFE_NT");
     if (nenv) B->nt_out = atoi(nenv);
     int nt = omp_get_max_threads();
-    /* keep V + M for one task around 256 KB (L2 is 512 KB on Zen 2) */
+    /* keep V + M for one task within about half of L2 */
     size_t per_group = (size_t)K * 6 * (C + C) * sizeof(float);
-    int G = (int)((256 * 1024) / per_group);
+    int G = (int)((g_cache.l2 / 2) / per_group);
     if (G < 1) G = 1;
     if (G > 4) G = 4;
     while (G > 1 && (NG + G - 1) / G < 3 * nt) G--;
-    /* Split OC so each split's weights (~2 MB) stay in L3 while all threads
-     * work through it (tasks are ordered split-major), and for parallelism. */
+    /* Split OC so each split's weights (about half an L3 slice) stay in L3
+     * while all threads work through it (tasks are ordered split-major), and
+     * for parallelism. */
     size_t u_all = (size_t)K * C * C * sizeof(float);
-    int S = (int)((u_all + (2u << 20) - 1) / (2u << 20));
+    size_t split = g_cache.l3_slice / 2;
+    int S = (int)((u_all + split - 1) / split);
     if (S > nob) S = nob;
     while (S < nob && ((NG + G - 1) / G) * S < 3 * nt) S++;
     B->G = G; B->S = S;
@@ -2468,6 +2575,9 @@ static void ifblock_prepare(IFBlock* B, int in_w, int in_h) {
         g_wino_ws = (float*)aligned_alloc(64, (need * nt * sizeof(float) + 63) & ~(size_t)63);
         assert(g_wino_ws);
     }
+    if (getenv("RIFE_VERBOSE"))
+        printf("IFBlock c=%d %dx%d: F(%dx%d,3x3) G=%d S=%d %s%s\n", C, W2, H2, B->m, B->m, B->G, B->S,
+               B->global ? "3-phase" : "tiled", B->nt_out ? " streaming-stores" : "");
 }
 
 static void ifblock_forward(IFBlock* B, const Tensor* in, Tensor* out) {
@@ -3070,6 +3180,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    detect_caches();
     fuse_resblocks(&g);
     fuse_deconv_pixelshuffle(&g);
     fuse_ifblocks(&g);
