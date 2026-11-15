@@ -116,7 +116,8 @@ typedef enum {
     LT_SIGMOID,
     LT_NOP,
     LT_IFBLOCK,
-    LT_MERGE
+    LT_MERGE,
+    LT_WARPDOWN
 } LayerType;
 
 typedef struct {
@@ -165,6 +166,9 @@ typedef struct {
 
     /* Fused final merge (LT_MERGE): branch weighted by 1 - m */
     int merge_inv[2];
+
+    /* Fused warp + concat + downscale (LT_WARPDOWN) */
+    int wd_n, wd_warp[8], wd_a[8], wd_b[8];
 } Layer;
 
 typedef struct {
@@ -2576,6 +2580,150 @@ static void fuse_final_merge(Graph* g) {
     printf("Fused %d final merges (sigmoid + 2 warps + blend)\n", fused);
 }
 
+/* =====================  FUSED WARP + CONCAT + DOWNSCALE  ===================== */
+/*
+ * Interp(Concat(warp(img0, f0), warp(img1, f1), t, mask, ...), 1/s) computes
+ * every warp at full resolution, writes the full-res concat buffer, and then
+ * reads back only the bilinear taps of the downscale (for s = 4, 4 of every 16
+ * pixels). LT_WARPDOWN evaluates the warps only at those taps and writes the
+ * low-res result directly.
+ *
+ * Layer fields: wd_n sources in concat order; source k is a warp if
+ * wd_warp[k] (blobs wd_a[k] = image, wd_b[k] = flow) or a plain blob wd_a[k].
+ * scale_w/scale_h are the Interp's. in_idx lists every blob read.
+ */
+
+static void warpdown_forward(const Layer* L, const Tensor* blobs, Tensor* out) {
+    const Tensor* first = &blobs[L->wd_a[0]];
+    int W = first->w, H = first->h;
+    int OW = out->w, OH = out->h;
+    size_t HW = (size_t)W * H;
+    assert(W >= 2 && H >= 2);
+
+    /* coordinate / weight tables, identical to interp_forward */
+    double ws = 1.0 / (double)L->scale_w, hs = 1.0 / (double)L->scale_h;
+    int* xofs = (int*)malloc(OW * sizeof(int));
+    float* alpha = (float*)malloc(OW * 2 * sizeof(float));
+    int* yofs = (int*)malloc(OH * sizeof(int));
+    float* beta = (float*)malloc(OH * 2 * sizeof(float));
+    for (int dx = 0; dx < OW; dx++) {
+        float fx = (float)((dx + 0.5) * ws - 0.5);
+        int sx = (int)floorf(fx);
+        fx -= (float)sx;
+        if (sx < 0) { sx = 0; fx = 0.0f; }
+        if (sx >= W - 1) { sx = W - 2; fx = 1.0f; }
+        xofs[dx] = sx; alpha[dx * 2] = 1.0f - fx; alpha[dx * 2 + 1] = fx;
+    }
+    for (int dy = 0; dy < OH; dy++) {
+        float fy = (float)((dy + 0.5) * hs - 0.5);
+        int sy = (int)floorf(fy);
+        fy -= (float)sy;
+        if (sy < 0) { sy = 0; fy = 0.0f; }
+        if (sy >= H - 1) { sy = H - 2; fy = 1.0f; }
+        yofs[dy] = sy; beta[dy * 2] = 1.0f - fy; beta[dy * 2 + 1] = fy;
+    }
+
+    int out_pw = out->is_padded ? OW + 2 : OW;
+    size_t out_ch = out->is_padded ? (size_t)(OH + 2) * out_pw : (size_t)OH * OW;
+    float* out_base = out->data + (out->is_padded ? out_pw + 1 : 0);
+
+    #pragma omp parallel for schedule(static)
+    for (int dy = 0; dy < OH; dy++) {
+        int sy = yofs[dy];
+        float b0 = beta[dy * 2], b1 = beta[dy * 2 + 1];
+        for (int dx = 0; dx < OW; dx++) {
+            int sx = xofs[dx];
+            float a0 = alpha[dx * 2], a1 = alpha[dx * 2 + 1];
+            /* tap (r, c) at full-res (sy + r, sx + c) */
+            size_t ti[4] = { (size_t)sy * W + sx, (size_t)sy * W + sx + 1,
+                             (size_t)(sy + 1) * W + sx, (size_t)(sy + 1) * W + sx + 1 };
+            int tx[4] = { sx, sx + 1, sx, sx + 1 }, ty[4] = { sy, sy, sy + 1, sy + 1 };
+            int oc = 0;
+            for (int k = 0; k < L->wd_n; k++) {
+                const Tensor* A = &blobs[L->wd_a[k]];
+                int C = A->c;
+                assert(C <= 8 && !A->is_padded);
+                float v[4][8];
+                if (L->wd_warp[k]) {
+                    const Tensor* F = &blobs[L->wd_b[k]];
+                    for (int t = 0; t < 4; t++)
+                        warp_sample3(A->data, HW, W, H, (float)tx[t] + F->data[ti[t]],
+                                     (float)ty[t] + F->data[HW + ti[t]], v[t]);
+                } else {
+                    for (int t = 0; t < 4; t++)
+                        for (int c = 0; c < C; c++) v[t][c] = A->data[c * HW + ti[t]];
+                }
+                for (int c = 0; c < C; c++) {
+                    float r0 = v[0][c] * a0 + v[1][c] * a1;
+                    float r1 = v[2][c] * a0 + v[3][c] * a1;
+                    out_base[(size_t)(oc + c) * out_ch + (size_t)dy * out_pw + dx] = r0 * b0 + r1 * b1;
+                }
+                oc += C;
+            }
+        }
+    }
+    free(xofs); free(alpha); free(yofs); free(beta);
+}
+
+static int count_consumers(const Graph* g, int blob) {
+    int n = 0;
+    for (int i = 0; i < g->n_layers; i++) {
+        const Layer* L = &g->layers[i];
+        if (L->type == LT_NOP || L->type == LT_INPUT) continue;
+        for (int j = 0; j < L->in_count; j++) n += (L->in_idx[j] == blob);
+        if (L->type == LT_CONV && L->res_blob_idx == blob) n++;
+    }
+    return n;
+}
+
+static void fuse_warp_downscale(Graph* g) {
+    int fused = 0;
+    for (int i = 0; i < g->n_layers; i++) {
+        Layer* I = &g->layers[i];
+        if (I->type != LT_INTERP || I->resize_type != 2 || I->out_w || I->out_h) continue;
+        if (I->scale_w >= 1.0f || I->scale_h >= 1.0f) continue;      /* downscale only */
+        int x = I->in_idx[0];
+        int qi = find_producer(g, x);
+        if (qi < 0 || g->layers[qi].type != LT_CONCAT || count_consumers(g, x) != 1) continue;
+        Layer* Q = &g->layers[qi];
+        if (Q->in_count > 8) continue;
+
+        int n_warp = 0, warp_layer[8], ok = 1;
+        for (int k = 0; k < Q->in_count && ok; k++) {
+            int p = find_producer(g, Q->in_idx[k]);
+            warp_layer[k] = -1;
+            if (p >= 0 && g->layers[p].type == LT_WARP && count_consumers(g, Q->in_idx[k]) == 1) {
+                warp_layer[k] = p;
+                n_warp++;
+            }
+        }
+        if (!ok || n_warp == 0) continue;
+
+        Layer F = *I;
+        F.type = LT_WARPDOWN;
+        F.wd_n = Q->in_count;
+        F.in_count = 0;
+        for (int k = 0; k < Q->in_count; k++) {
+            if (warp_layer[k] >= 0) {
+                const Layer* Wl = &g->layers[warp_layer[k]];
+                F.wd_warp[k] = 1; F.wd_a[k] = Wl->in_idx[0]; F.wd_b[k] = Wl->in_idx[1];
+                F.in_idx[F.in_count++] = Wl->in_idx[0];
+                F.in_idx[F.in_count++] = Wl->in_idx[1];
+            } else {
+                F.wd_warp[k] = 0; F.wd_a[k] = Q->in_idx[k]; F.wd_b[k] = -1;
+                F.in_idx[F.in_count++] = Q->in_idx[k];
+            }
+        }
+        assert(F.in_count <= 8);
+        for (int k = 0; k < Q->in_count; k++)
+            if (warp_layer[k] >= 0) g->layers[warp_layer[k]].type = LT_NOP;
+        Q->type = LT_NOP;
+        *I = F;
+        fused++;
+    }
+    printf("Fused %d warp+concat+downscale ops\n", fused);
+}
+
 /* =====================  GRAPH OPTIMIZATION PASSES  ===================== */
 
 static void fuse_resblocks(Graph* g) {
@@ -2645,7 +2793,7 @@ static void graph_execute(const Graph* g, Tensor* blobs) {
     s2_time = 0;
     pad_time = 0;
     s1_8_time = 0; s1_16_time = 0; s1_32_time = 0; s1_64_time = 0;
-    double type_times[16] = {0};
+    double type_times[32] = {0};
     for (int i = 0; i < g->n_layers; i++) {
         const Layer* L = &g->layers[i];
         if (L->type == LT_NOP) continue;
@@ -2701,18 +2849,21 @@ static void graph_execute(const Graph* g, Tensor* blobs) {
             case LT_MERGE:
                 merge_forward(L, blobs, &blobs[L->out_idx[0]]);
                 break;
+            case LT_WARPDOWN:
+                warpdown_forward(L, blobs, &blobs[L->out_idx[0]]);
+                break;
         }
         clock_gettime(CLOCK_MONOTONIC, &t1);
         type_times[L->type] += (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) * 1e-6;
     }
     const char* type_names[] = {
         "Input", "Split", "Concat", "Interp", "Conv", "Deconv", "ReLU",
-        "BinaryOp", "PixelShuffle", "Crop", "Warp", "Eltwise", "Sigmoid", "Nop", "IFBlock", "Merge"
+        "BinaryOp", "PixelShuffle", "Crop", "Warp", "Eltwise", "Sigmoid", "Nop", "IFBlock", "Merge", "WarpDown"
     };
     static int profile = -1;
     if (profile < 0) profile = getenv("RIFE_PROFILE") != NULL;
     if (!profile) return;
-    for (int t = 0; t < 16; t++) {
+    for (int t = 0; t < 17; t++) {
         if (type_times[t] > 0.01) {
             printf("  %-14s: %6.2f ms\n", type_names[t], type_times[t]);
         }
@@ -2815,6 +2966,7 @@ int main(int argc, char** argv) {
     fuse_deconv_pixelshuffle(&g);
     fuse_ifblocks(&g);
     fuse_final_merge(&g);
+    fuse_warp_downscale(&g);
 
     int w, h;
     Tensor img0 = load_image_rgb(img0_path, &w, &h);
@@ -2889,6 +3041,12 @@ int main(int argc, char** argv) {
                     oh *= 2;
                     oc /= 4;
                 }
+                break;
+            case LT_WARPDOWN:
+                ow = (int)(iw * L->scale_w);
+                oh = (int)(ih * L->scale_h);
+                oc = 0;
+                for (int k = 0; k < L->wd_n; k++) oc += shapes[L->wd_a[k]][2];
                 break;
             case LT_IFBLOCK: {
                 int w1 = (iw - 1) / 2 + 1, h1 = (ih - 1) / 2 + 1;
@@ -2980,7 +3138,7 @@ int main(int argc, char** argv) {
                 int dup = 0;
                 for (int k = 0; k < Q->in_count; k++) dup += (Q->in_idx[k] == x);
                 if (alias_of[x] == -1 && consumers[x] == 1 && dup == 1 && !blob_is_padded[x] &&
-                    (pt == LT_WARP || pt == LT_INTERP || pt == LT_CONCAT)) {
+                    (pt == LT_WARP || pt == LT_INTERP || pt == LT_CONCAT || pt == LT_WARPDOWN)) {
                     alias_of[x] = Q->out_idx[0];
                     alias_offset[x] = ch;
                     n_inplace++;
