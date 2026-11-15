@@ -4,7 +4,10 @@
  *   Output: interpolated RGB image (HxWx3, uint8)
  *
  * Build:  gcc -O3 -march=native -fopenmp rife_v46.c -o rife_v46 -lm
- * Run:    ./rife_v46 flownet-v46.bin frame0.png frame1.png 0.5 out.png
+ * Run:    ./rife_v46 [--pad 32|64] flownet-v46.bin frame0.png frame1.png 0.5 out.png
+ *
+ * --pad sets the multiple the frame is zero-padded to (default 32, as in
+ * rife-ncnn-vulkan). --pad 64 matches Practical-RIFE's inference scripts.
  *
  * Fully vectorized AVX2/FMA execution with persistent workspaces,
  * zero-copy splits/crops, and pre-reordered weights. Zero external deps.
@@ -2609,8 +2612,25 @@ static void save_image_rgb(const char* path, const Tensor* t) {
 /* =====================  MAIN  ===================== */
 
 int main(int argc, char** argv) {
+    /* Options (may appear anywhere): --pad N. Remaining args are positional. */
+    int pad = 32;
+    int nargs = 1;
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--pad") && i + 1 < argc) {
+            pad = atoi(argv[++i]);
+        } else if (!strncmp(argv[i], "--pad=", 6)) {
+            pad = atoi(argv[i] + 6);
+        } else {
+            argv[nargs++] = argv[i];
+        }
+    }
+    argc = nargs;
+    if (pad <= 0 || pad % 32 != 0) {
+        fprintf(stderr, "--pad must be a positive multiple of 32 (got %d)\n", pad);
+        return 1;
+    }
     if (argc < 6) {
-        fprintf(stderr, "usage: %s model.bin frame0.png frame1.png timestep out.png [iterations]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--pad 32|64] model.bin frame0.png frame1.png timestep out.png [iterations]\n", argv[0]);
         return 1;
     }
 
@@ -2646,8 +2666,8 @@ int main(int argc, char** argv) {
     Tensor img0 = load_image_rgb(img0_path, &w, &h);
     Tensor img1 = load_image_rgb(img1_path, &w, &h);
 
-    int wp = (w + 31) / 32 * 32;
-    int hp = (h + 31) / 32 * 32;
+    int wp = (w + pad - 1) / pad * pad;
+    int hp = (h + pad - 1) / pad * pad;
 
     // Shape inference
     int shapes[MAX_BLOBS][3];
