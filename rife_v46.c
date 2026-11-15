@@ -115,7 +115,8 @@ typedef enum {
     LT_ELTWISE,
     LT_SIGMOID,
     LT_NOP,
-    LT_IFBLOCK
+    LT_IFBLOCK,
+    LT_MERGE
 } LayerType;
 
 typedef struct {
@@ -161,6 +162,9 @@ typedef struct {
 
     /* Fused IFBlock (LT_IFBLOCK) */
     struct IFBlock* ifb;
+
+    /* Fused final merge (LT_MERGE): branch weighted by 1 - m */
+    int merge_inv[2];
 } Layer;
 
 typedef struct {
@@ -2432,6 +2436,146 @@ static void fuse_ifblocks(Graph* g) {
     printf("Fused %d IFBlocks (Winograd F(4x4,3x3) residual convs)\n", fused);
 }
 
+/* =====================  FUSED FINAL MERGE  ===================== */
+/*
+ * out = warp(imgA, flowA) * wA + warp(imgB, flowB) * wB, where one weight is
+ * m = sigmoid(logit) and the other 1 - m. Replaces Sigmoid, the 1 - m BinaryOp,
+ * two Warps, two Muls and the final Add with a single full-res pass.
+ * Layer fields: in_idx = { imgA, flowA, imgB, flowB, logit }, merge_inv[0/1]
+ * says whether branch A/B is weighted by 1 - m.
+ */
+
+/* Bilinear border-clamped sample of a 3-channel planar image, same arithmetic
+ * as warp_forward. */
+static inline void warp_sample3(const float* img, size_t HW, int W, int H, float sx, float sy, float o[3]) {
+    float flx = floorf(sx), fly = floorf(sy);
+    int x0 = (int)flx, y0 = (int)fly, x1 = x0 + 1, y1 = y0 + 1;
+    if (x0 < 0) x0 = 0; else if (x0 > W - 1) x0 = W - 1;
+    if (y0 < 0) y0 = 0; else if (y0 > H - 1) y0 = H - 1;
+    if (x1 < 0) x1 = 0; else if (x1 > W - 1) x1 = W - 1;
+    if (y1 < 0) y1 = 0; else if (y1 > H - 1) y1 = H - 1;
+    float a = sx - flx, b = sy - fly, ia = 1.0f - a, ib = 1.0f - b;
+    size_t i00 = (size_t)y0 * W + x0, i01 = (size_t)y0 * W + x1;
+    size_t i10 = (size_t)y1 * W + x0, i11 = (size_t)y1 * W + x1;
+    for (int c = 0; c < 3; c++) {
+        const float* p = img + c * HW;
+        float t0 = p[i00] * ia + p[i01] * a;
+        float t1 = p[i10] * ia + p[i11] * a;
+        o[c] = t0 * ib + t1 * b;
+    }
+}
+
+static void merge_forward(const Layer* L, const Tensor* blobs, Tensor* out) {
+    const Tensor *imgA = &blobs[L->in_idx[0]], *flowA = &blobs[L->in_idx[1]];
+    const Tensor *imgB = &blobs[L->in_idx[2]], *flowB = &blobs[L->in_idx[3]];
+    const Tensor *logit = &blobs[L->in_idx[4]];
+    assert(!imgA->is_padded && !imgB->is_padded && !flowA->is_padded && !flowB->is_padded &&
+           !logit->is_padded && !out->is_padded);
+    assert(imgA->c == 3 && imgB->c == 3 && out->c == 3);
+    int W = out->w, H = out->h;
+    size_t HW = (size_t)W * H;
+    int invA = L->merge_inv[0], invB = L->merge_inv[1];
+
+    #pragma omp parallel for schedule(static)
+    for (int y = 0; y < H; y++) {
+        for (int x = 0; x < W; x++) {
+            size_t i = (size_t)y * W + x;
+            float v = logit->data[i];
+            v = fmaxf(-88.0f, fminf(v, 88.0f));
+            float m = 1.0f / (1.0f + expf(-v));
+            float wA = invA ? 1.0f - m : m, wB = invB ? 1.0f - m : m;
+            float a[3], b[3];
+            warp_sample3(imgA->data, HW, W, H, (float)x + flowA->data[i], (float)y + flowA->data[HW + i], a);
+            warp_sample3(imgB->data, HW, W, H, (float)x + flowB->data[i], (float)y + flowB->data[HW + i], b);
+            for (int c = 0; c < 3; c++)
+                out->data[c * HW + i] = a[c] * wA + b[c] * wB;
+        }
+    }
+}
+
+static int find_producer(const Graph* g, int blob) {
+    for (int i = 0; i < g->n_layers; i++) {
+        const Layer* L = &g->layers[i];
+        if (L->type == LT_NOP || L->type == LT_INPUT) continue;
+        for (int o = 0; o < L->out_count; o++)
+            if (L->out_idx[o] == blob) return i;
+    }
+    return -1;
+}
+
+/* Follow zero-copy Splits back to the blob they view. */
+static int through_splits(const Graph* g, int blob, int* split_layer) {
+    int p = find_producer(g, blob);
+    if (p >= 0 && g->layers[p].type == LT_SPLIT) {
+        if (split_layer) *split_layer = p;
+        return g->layers[p].in_idx[0];
+    }
+    return blob;
+}
+
+static void fuse_final_merge(Graph* g) {
+    int fused = 0;
+    for (int i = 0; i < g->n_layers; i++) {
+        Layer* Ladd = &g->layers[i];
+        if (Ladd->type != LT_BINARYOP || Ladd->op_type != 0 || Ladd->with_scalar || Ladd->in_count != 2) continue;
+        int mul[2], warp[2], inv[2], extra[2], sig_in[2], ok = 1;
+        for (int k = 0; k < 2 && ok; k++) {
+            mul[k] = find_producer(g, Ladd->in_idx[k]);
+            extra[k] = -1;
+            const Layer* M = mul[k] >= 0 ? &g->layers[mul[k]] : NULL;
+            ok = M && M->type == LT_BINARYOP && M->op_type == 2 && !M->with_scalar && M->in_count == 2;
+            if (!ok) break;
+            /* one input is a 3-channel warp, the other the weight */
+            int wi = -1;
+            for (int q = 0; q < 2; q++) {
+                int p = find_producer(g, M->in_idx[q]);
+                if (p >= 0 && g->layers[p].type == LT_WARP) { warp[k] = p; wi = 1 - q; }
+            }
+            ok = wi >= 0;
+            if (!ok) break;
+            int w = through_splits(g, M->in_idx[wi], NULL);
+            int p = find_producer(g, w);
+            inv[k] = 0;
+            if (p >= 0 && g->layers[p].type == LT_BINARYOP && g->layers[p].op_type == 7 &&
+                g->layers[p].with_scalar && g->layers[p].b_scalar == 1.0f) {
+                inv[k] = 1;
+                extra[k] = p;
+                w = through_splits(g, g->layers[p].in_idx[0], NULL);
+                p = find_producer(g, w);
+            }
+            ok = p >= 0 && g->layers[p].type == LT_SIGMOID;
+            if (ok) sig_in[k] = p;
+        }
+        if (!ok || sig_in[0] != sig_in[1] || inv[0] == inv[1]) continue;
+
+        const Layer* Ls = &g->layers[sig_in[0]];
+        int logit = Ls->in_idx[0];
+        const Layer *WA = &g->layers[warp[0]], *WB = &g->layers[warp[1]];
+        int out = Ladd->out_idx[0];
+        int split_of_sig = -1;
+        for (int j = 0; j < g->n_layers; j++)
+            if (g->layers[j].type == LT_SPLIT && g->layers[j].in_idx[0] == Ls->out_idx[0]) split_of_sig = j;
+
+        Layer F = *Ladd;
+        F.type = LT_MERGE;
+        F.in_count = 5;
+        F.in_idx[0] = WA->in_idx[0]; F.in_idx[1] = WA->in_idx[1];
+        F.in_idx[2] = WB->in_idx[0]; F.in_idx[3] = WB->in_idx[1];
+        F.in_idx[4] = logit;
+        F.out_count = 1; F.out_idx[0] = out;
+        F.merge_inv[0] = inv[0]; F.merge_inv[1] = inv[1];
+
+        g->layers[sig_in[0]].type = LT_NOP;
+        g->layers[warp[0]].type = LT_NOP; g->layers[warp[1]].type = LT_NOP;
+        g->layers[mul[0]].type = LT_NOP;  g->layers[mul[1]].type = LT_NOP;
+        for (int k = 0; k < 2; k++) if (extra[k] >= 0) g->layers[extra[k]].type = LT_NOP;
+        if (split_of_sig >= 0) g->layers[split_of_sig].type = LT_NOP;
+        *Ladd = F;
+        fused++;
+    }
+    printf("Fused %d final merges (sigmoid + 2 warps + blend)\n", fused);
+}
+
 /* =====================  GRAPH OPTIMIZATION PASSES  ===================== */
 
 static void fuse_resblocks(Graph* g) {
@@ -2554,18 +2698,21 @@ static void graph_execute(const Graph* g, Tensor* blobs) {
             case LT_IFBLOCK:
                 ifblock_forward(L->ifb, &blobs[L->in_idx[0]], &blobs[L->out_idx[0]]);
                 break;
+            case LT_MERGE:
+                merge_forward(L, blobs, &blobs[L->out_idx[0]]);
+                break;
         }
         clock_gettime(CLOCK_MONOTONIC, &t1);
         type_times[L->type] += (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) * 1e-6;
     }
     const char* type_names[] = {
         "Input", "Split", "Concat", "Interp", "Conv", "Deconv", "ReLU",
-        "BinaryOp", "PixelShuffle", "Crop", "Warp", "Eltwise", "Sigmoid", "Nop", "IFBlock"
+        "BinaryOp", "PixelShuffle", "Crop", "Warp", "Eltwise", "Sigmoid", "Nop", "IFBlock", "Merge"
     };
     static int profile = -1;
     if (profile < 0) profile = getenv("RIFE_PROFILE") != NULL;
     if (!profile) return;
-    for (int t = 0; t < 15; t++) {
+    for (int t = 0; t < 16; t++) {
         if (type_times[t] > 0.01) {
             printf("  %-14s: %6.2f ms\n", type_names[t], type_times[t]);
         }
@@ -2667,6 +2814,7 @@ int main(int argc, char** argv) {
     fuse_resblocks(&g);
     fuse_deconv_pixelshuffle(&g);
     fuse_ifblocks(&g);
+    fuse_final_merge(&g);
 
     int w, h;
     Tensor img0 = load_image_rgb(img0_path, &w, &h);
