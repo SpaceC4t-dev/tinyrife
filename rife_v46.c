@@ -23,6 +23,9 @@
 
 #ifdef _OPENMP
 #include <omp.h>
+#else
+static inline int omp_get_thread_num(void) { return 0; }
+static inline int omp_get_max_threads(void) { return 1; }
 #endif
 
 /* =====================  BASIC TYPES & MEMORY  ===================== */
@@ -108,7 +111,8 @@ typedef enum {
     LT_WARP,
     LT_ELTWISE,
     LT_SIGMOID,
-    LT_NOP
+    LT_NOP,
+    LT_IFBLOCK
 } LayerType;
 
 typedef struct {
@@ -151,6 +155,9 @@ typedef struct {
 
     /* ReLU */
     float relu_slope;
+
+    /* Fused IFBlock (LT_IFBLOCK) */
+    struct IFBlock* ifb;
 } Layer;
 
 typedef struct {
@@ -1205,15 +1212,10 @@ static void conv_forward(const Layer* L, const Tensor* in, const Tensor* res, Te
     }
 }
 
+static void deconv_core(const Layer* L, const float* in_hwc, int W, int H, int C, Tensor* out);
+
 static void deconv_forward(const Layer* L, const Tensor* in, Tensor* out) {
     int W = in->w, H = in->h, C = in->c;
-    int OW = out->w, OH = out->h;
-    if (L->upscale == 2) {
-        OW /= 2;
-        OH /= 2;
-    }
-    const float* wt_reord = L->weights;
-    const float* B = L->bias;
     scratch_check((size_t)H * W * C, L->name);
     float* in_hwc = g_pin_scratch;
 
@@ -1254,6 +1256,19 @@ static void deconv_forward(const Layer* L, const Tensor* in, Tensor* out) {
             }
         }
     }
+    deconv_core(L, in_hwc, W, H, C, out);
+}
+
+/* Deconv (K=4, S=2, P=1, OC=24) from an HWC input, optionally writing through
+ * a fused PixelShuffle(2). */
+static void deconv_core(const Layer* L, const float* in_hwc, int W, int H, int C, Tensor* out) {
+    int OW = out->w, OH = out->h;
+    if (L->upscale == 2) {
+        OW /= 2;
+        OH /= 2;
+    }
+    const float* wt_reord = L->weights;
+    const float* B = L->bias;
 
     __m256 b0 = B ? _mm256_loadu_ps(B + 0) : _mm256_setzero_ps();
     __m256 b1 = B ? _mm256_loadu_ps(B + 8) : _mm256_setzero_ps();
@@ -1776,7 +1791,10 @@ static void concat_forward(const Layer* L, const Tensor* blobs, Tensor* out) {
             const float* src = in->data;
             float* dst = out->data + out_ch * HW;
             size_t N = (size_t)in_c * HW;
-            memcpy(dst, src, N * sizeof(float));
+            size_t chunk = 1 << 16;
+            #pragma omp parallel for schedule(static)
+            for (size_t o = 0; o < N; o += chunk)
+                memcpy(dst + o, src + o, (N - o < chunk ? N - o : chunk) * sizeof(float));
             out_ch += in_c;
         }
     }
@@ -1884,6 +1902,525 @@ static void warp_forward(const Tensor* img, const Tensor* flow, Tensor* out) {
             }
         }
     }
+}
+
+/* =====================  FUSED IFBLOCK (packed-8 layout)  ===================== */
+/*
+ * One RIFE IFBlock = conv3x3s2+lrelu, conv3x3s2+lrelu, 8 x (conv3x3 + x, lrelu),
+ * deconv4x4s2 + PixelShuffle(2). Inside the block activations live in a packed
+ * layout [C/8][PH][PW][8] with a zero border (1 px top/left, enough bottom/right
+ * to cover whole 4x4 Winograd tiles), so every kernel reads 8 channels per load.
+ *
+ *  - stride-2 convs: direct, 16 OC x 6 px register tile (12 accumulators).
+ *  - stride-1 convs: Winograd F(4x4, 3x3). Each task takes a group of tiles,
+ *    transforms them into an L2-resident buffer, runs 36 small GEMMs with a
+ *    6 tile x 16 OC microkernel, and applies the output transform with bias,
+ *    residual and LeakyReLU fused.
+ */
+
+typedef struct {
+    int C, H, W;   /* logical size */
+    int PH, PW;    /* padded size */
+    float* data;
+} P8;
+
+static void p8_alloc(P8* t, int C, int H, int W) {
+    t->C = C; t->H = H; t->W = W;
+    t->PH = ((H + 3) / 4) * 4 + 2;
+    t->PW = ((W + 3) / 4) * 4 + 2;
+    size_t n = (size_t)C * t->PH * t->PW;
+    t->data = (float*)aligned_alloc(64, (n * sizeof(float) + 63) & ~(size_t)63);
+    assert(t->data);
+    memset(t->data, 0, n * sizeof(float));
+}
+
+static inline size_t p8_plane(const P8* t) { return (size_t)t->PH * t->PW * 8; }
+
+/* channel block cb, padded coordinates (y, x) */
+static inline float* p8_at(const P8* t, int cb, int y, int x) {
+    return t->data + (size_t)cb * p8_plane(t) + ((size_t)y * t->PW + x) * 8;
+}
+
+typedef struct IFBlock {
+    Layer conv0a, conv0b, res[8], deconv;
+    int c0, c;             /* channels after conv0a / conv0b */
+    float* w0a;            /* [c0/16][Cin][9][16] */
+    float* w0b;            /* [c/16][c0][9][16] */
+    float* U[8];           /* Winograd weights [36][c/16][c][16] */
+    int in_w, in_h;        /* input size the buffers were built for */
+    P8 a, x, y;            /* conv0a out, ping-pong for the res convs */
+    int G, S;              /* tile groups per task, OC splits */
+    int global;            /* 3-phase Winograd (few tiles, big weights) */
+    float *gV, *gM;        /* its buffers */
+} IFBlock;
+
+/* Per-thread Winograd workspace */
+static float* g_wino_ws = NULL;
+static size_t g_wino_ws_per_thread = 0;
+
+static inline __m256 lrelu8(__m256 v, __m256 slope) {
+    return _mm256_max_ps(v, _mm256_mul_ps(v, slope));   /* valid for 0 <= slope <= 1 */
+}
+
+/* ---------- stride-2 direct conv, output packed into a P8 ---------- */
+
+/* in: planar (pack=1, channel c at in + c*in_plane) or packed-8 (pack=8, block
+ * c/8 at in + (c/8)*in_plane, lane c%8). Pixel (y, x) in padded coordinates is at
+ * + (y*in_PW + x)*pack. wt: [OC/16][C][9][16]. */
+static void conv3x3s2_p8(const float* in, int pack, size_t in_plane, int in_PW, int C,
+                         const float* wt, const float* bias, float slope, P8* out) {
+    int OC = out->C, OH = out->H, OW = out->W;
+    int nob = OC / 16;
+    __m256 vs = _mm256_set1_ps(slope);
+
+    #pragma omp parallel for collapse(2) schedule(dynamic, 4)
+    for (int ob = 0; ob < nob; ob++) {
+        for (int oy = 0; oy < OH; oy++) {
+            const float* wob = wt + (size_t)ob * C * 9 * 16;
+            __m256 b0 = _mm256_loadu_ps(bias + ob * 16), b1 = _mm256_loadu_ps(bias + ob * 16 + 8);
+            float* o0 = p8_at(out, ob * 2, oy + 1, 1);
+            float* o1 = p8_at(out, ob * 2 + 1, oy + 1, 1);
+            int ox = 0;
+            for (; ox + 6 <= OW; ox += 6) {
+                __m256 c00 = b0, c01 = b1, c10 = b0, c11 = b1, c20 = b0, c21 = b1;
+                __m256 c30 = b0, c31 = b1, c40 = b0, c41 = b1, c50 = b0, c51 = b1;
+                const float* w = wob;
+                for (int c = 0; c < C; c++) {
+                    const float* ic = in + (size_t)(c / pack) * in_plane + (c % pack);
+                    for (int ky = 0; ky < 3; ky++) {
+                        const float* row = ic + ((size_t)(2 * oy + ky) * in_PW + 2 * ox) * pack;
+                        for (int kx = 0; kx < 3; kx++) {
+                            const float* p = row + kx * pack;
+                            __m256 w0 = _mm256_load_ps(w), w1 = _mm256_load_ps(w + 8);
+                            __m256 v;
+                            w += 16;
+                            v = _mm256_broadcast_ss(p + 0 * pack); c00 = _mm256_fmadd_ps(v, w0, c00); c01 = _mm256_fmadd_ps(v, w1, c01);
+                            v = _mm256_broadcast_ss(p + 2 * pack); c10 = _mm256_fmadd_ps(v, w0, c10); c11 = _mm256_fmadd_ps(v, w1, c11);
+                            v = _mm256_broadcast_ss(p + 4 * pack); c20 = _mm256_fmadd_ps(v, w0, c20); c21 = _mm256_fmadd_ps(v, w1, c21);
+                            v = _mm256_broadcast_ss(p + 6 * pack); c30 = _mm256_fmadd_ps(v, w0, c30); c31 = _mm256_fmadd_ps(v, w1, c31);
+                            v = _mm256_broadcast_ss(p + 8 * pack); c40 = _mm256_fmadd_ps(v, w0, c40); c41 = _mm256_fmadd_ps(v, w1, c41);
+                            v = _mm256_broadcast_ss(p + 10 * pack); c50 = _mm256_fmadd_ps(v, w0, c50); c51 = _mm256_fmadd_ps(v, w1, c51);
+                        }
+                    }
+                }
+                _mm256_storeu_ps(o0 + (ox + 0) * 8, lrelu8(c00, vs)); _mm256_storeu_ps(o1 + (ox + 0) * 8, lrelu8(c01, vs));
+                _mm256_storeu_ps(o0 + (ox + 1) * 8, lrelu8(c10, vs)); _mm256_storeu_ps(o1 + (ox + 1) * 8, lrelu8(c11, vs));
+                _mm256_storeu_ps(o0 + (ox + 2) * 8, lrelu8(c20, vs)); _mm256_storeu_ps(o1 + (ox + 2) * 8, lrelu8(c21, vs));
+                _mm256_storeu_ps(o0 + (ox + 3) * 8, lrelu8(c30, vs)); _mm256_storeu_ps(o1 + (ox + 3) * 8, lrelu8(c31, vs));
+                _mm256_storeu_ps(o0 + (ox + 4) * 8, lrelu8(c40, vs)); _mm256_storeu_ps(o1 + (ox + 4) * 8, lrelu8(c41, vs));
+                _mm256_storeu_ps(o0 + (ox + 5) * 8, lrelu8(c50, vs)); _mm256_storeu_ps(o1 + (ox + 5) * 8, lrelu8(c51, vs));
+            }
+            for (; ox < OW; ox++) {
+                __m256 c00 = b0, c01 = b1;
+                const float* w = wob;
+                for (int c = 0; c < C; c++) {
+                    const float* ic = in + (size_t)(c / pack) * in_plane + (c % pack);
+                    for (int ky = 0; ky < 3; ky++) {
+                        const float* row = ic + ((size_t)(2 * oy + ky) * in_PW + 2 * ox) * pack;
+                        for (int kx = 0; kx < 3; kx++) {
+                            __m256 v = _mm256_broadcast_ss(row + kx * pack);
+                            c00 = _mm256_fmadd_ps(v, _mm256_load_ps(w), c00);
+                            c01 = _mm256_fmadd_ps(v, _mm256_load_ps(w + 8), c01);
+                            w += 16;
+                        }
+                    }
+                }
+                _mm256_storeu_ps(o0 + ox * 8, lrelu8(c00, vs));
+                _mm256_storeu_ps(o1 + ox * 8, lrelu8(c01, vs));
+            }
+        }
+    }
+}
+
+/* ---------- Winograd F(4x4, 3x3) ---------- */
+
+/* 1-D B^T (6 -> 6) */
+#define WINO_BT(d0, d1, d2, d3, d4, d5, r0, r1, r2, r3, r4, r5) do { \
+    __m256 _4 = _mm256_set1_ps(4.0f), _5 = _mm256_set1_ps(5.0f), _2 = _mm256_set1_ps(2.0f); \
+    __m256 _t0 = _mm256_fnmadd_ps(_4, d2, d4);          /* d4 - 4 d2 */ \
+    __m256 _t1 = _mm256_fnmadd_ps(_4, d1, d3);          /* d3 - 4 d1 */ \
+    __m256 _t2 = _mm256_sub_ps(d4, d2);                 /* d4 - d2   */ \
+    __m256 _t3 = _mm256_mul_ps(_2, _mm256_sub_ps(d3, d1)); /* 2(d3 - d1) */ \
+    r0 = _mm256_fnmadd_ps(_5, d2, _mm256_fmadd_ps(_4, d0, d4)); \
+    r1 = _mm256_add_ps(_t0, _t1); \
+    r2 = _mm256_sub_ps(_t0, _t1); \
+    r3 = _mm256_add_ps(_t2, _t3); \
+    r4 = _mm256_sub_ps(_t2, _t3); \
+    r5 = _mm256_fnmadd_ps(_5, d3, _mm256_fmadd_ps(_4, d1, d5)); \
+} while (0)
+
+/* 1-D A^T (6 -> 4) */
+#define WINO_AT(m0, m1, m2, m3, m4, m5, o0, o1, o2, o3) do { \
+    __m256 _a = _mm256_add_ps(m1, m2), _b = _mm256_sub_ps(m1, m2); \
+    __m256 _c = _mm256_add_ps(m3, m4), _d = _mm256_sub_ps(m3, m4); \
+    o0 = _mm256_add_ps(_mm256_add_ps(m0, _a), _c); \
+    o1 = _mm256_fmadd_ps(_mm256_set1_ps(2.0f), _d, _b); \
+    o2 = _mm256_fmadd_ps(_mm256_set1_ps(4.0f), _c, _a); \
+    o3 = _mm256_add_ps(_mm256_fmadd_ps(_mm256_set1_ps(8.0f), _d, _b), m5); \
+} while (0)
+
+/* raw [OC][IC][3][3] -> U [36][OC/16][IC][16], U = G g G^T */
+static float* wino_weights(const float* raw, int OC, int IC) {
+    static const double G[6][3] = {
+        { 1.0 / 4,  0,         0       },
+        {-1.0 / 6, -1.0 / 6,  -1.0 / 6 },
+        {-1.0 / 6,  1.0 / 6,  -1.0 / 6 },
+        { 1.0 / 24, 1.0 / 12,  1.0 / 6 },
+        { 1.0 / 24, -1.0 / 12, 1.0 / 6 },
+        { 0,        0,         1       },
+    };
+    int nob = OC / 16;
+    size_t n = (size_t)36 * OC * IC;
+    float* U = (float*)aligned_alloc(64, (n * sizeof(float) + 63) & ~(size_t)63);
+    assert(U);
+    for (int oc = 0; oc < OC; oc++) {
+        for (int ic = 0; ic < IC; ic++) {
+            const float* g = raw + ((size_t)oc * IC + ic) * 9;
+            double t[6][3];
+            for (int i = 0; i < 6; i++)
+                for (int j = 0; j < 3; j++)
+                    t[i][j] = G[i][0] * g[0 * 3 + j] + G[i][1] * g[1 * 3 + j] + G[i][2] * g[2 * 3 + j];
+            for (int i = 0; i < 6; i++) {
+                for (int j = 0; j < 6; j++) {
+                    double u = t[i][0] * G[j][0] + t[i][1] * G[j][1] + t[i][2] * G[j][2];
+                    int k = i * 6 + j;
+                    U[(((size_t)k * nob + oc / 16) * IC + ic) * 16 + oc % 16] = (float)u;
+                }
+            }
+        }
+    }
+    return U;
+}
+
+/* Input transform of one 6x6 tile (top-left padded corner 4ty, 4tx) for channel
+ * block cb. Writes 36 vectors, k-th at dst + k*ks. */
+static inline void wino_in_tile(const P8* in, int ty, int tx, int cb, float* dst, size_t ks) {
+    const float* src = in->data + (size_t)cb * p8_plane(in) + ((size_t)(4 * ty) * in->PW + 4 * tx) * 8;
+    size_t rs = (size_t)in->PW * 8;
+    __m256 r[6][6];
+    for (int c = 0; c < 6; c++) {
+        const float* s = src + c * 8;
+        __m256 d0 = _mm256_loadu_ps(s), d1 = _mm256_loadu_ps(s + rs), d2 = _mm256_loadu_ps(s + 2 * rs);
+        __m256 d3 = _mm256_loadu_ps(s + 3 * rs), d4 = _mm256_loadu_ps(s + 4 * rs), d5 = _mm256_loadu_ps(s + 5 * rs);
+        WINO_BT(d0, d1, d2, d3, d4, d5, r[0][c], r[1][c], r[2][c], r[3][c], r[4][c], r[5][c]);
+    }
+    for (int i = 0; i < 6; i++) {
+        __m256 v0, v1, v2, v3, v4, v5;
+        WINO_BT(r[i][0], r[i][1], r[i][2], r[i][3], r[i][4], r[i][5], v0, v1, v2, v3, v4, v5);
+        _mm256_storeu_ps(dst + (i * 6 + 0) * ks, v0);
+        _mm256_storeu_ps(dst + (i * 6 + 1) * ks, v1);
+        _mm256_storeu_ps(dst + (i * 6 + 2) * ks, v2);
+        _mm256_storeu_ps(dst + (i * 6 + 3) * ks, v3);
+        _mm256_storeu_ps(dst + (i * 6 + 4) * ks, v4);
+        _mm256_storeu_ps(dst + (i * 6 + 5) * ks, v5);
+    }
+}
+
+/* 6 tiles x 16 OC microkernel over IC = 8*ICb. v: [ICb][6][8] (tile-major within
+ * a channel block), u: [IC][16]. Writes tile j's 16 outputs to m + j*ts. */
+static inline void wino_gemm_6x16(const float* v, const float* u, int ICb, float* m, size_t ts) {
+    __m256 c00 = _mm256_setzero_ps(), c01 = c00, c10 = c00, c11 = c00, c20 = c00, c21 = c00;
+    __m256 c30 = c00, c31 = c00, c40 = c00, c41 = c00, c50 = c00, c51 = c00;
+    for (int cb = 0; cb < ICb; cb++, v += 48) {
+        for (int l = 0; l < 8; l++) {
+            __m256 w0 = _mm256_load_ps(u), w1 = _mm256_load_ps(u + 8), b;
+            u += 16;
+            b = _mm256_broadcast_ss(v + l + 0);  c00 = _mm256_fmadd_ps(b, w0, c00); c01 = _mm256_fmadd_ps(b, w1, c01);
+            b = _mm256_broadcast_ss(v + l + 8);  c10 = _mm256_fmadd_ps(b, w0, c10); c11 = _mm256_fmadd_ps(b, w1, c11);
+            b = _mm256_broadcast_ss(v + l + 16); c20 = _mm256_fmadd_ps(b, w0, c20); c21 = _mm256_fmadd_ps(b, w1, c21);
+            b = _mm256_broadcast_ss(v + l + 24); c30 = _mm256_fmadd_ps(b, w0, c30); c31 = _mm256_fmadd_ps(b, w1, c31);
+            b = _mm256_broadcast_ss(v + l + 32); c40 = _mm256_fmadd_ps(b, w0, c40); c41 = _mm256_fmadd_ps(b, w1, c41);
+            b = _mm256_broadcast_ss(v + l + 40); c50 = _mm256_fmadd_ps(b, w0, c50); c51 = _mm256_fmadd_ps(b, w1, c51);
+        }
+    }
+    _mm256_storeu_ps(m + 0 * ts, c00); _mm256_storeu_ps(m + 0 * ts + 8, c01);
+    _mm256_storeu_ps(m + 1 * ts, c10); _mm256_storeu_ps(m + 1 * ts + 8, c11);
+    _mm256_storeu_ps(m + 2 * ts, c20); _mm256_storeu_ps(m + 2 * ts + 8, c21);
+    _mm256_storeu_ps(m + 3 * ts, c30); _mm256_storeu_ps(m + 3 * ts + 8, c31);
+    _mm256_storeu_ps(m + 4 * ts, c40); _mm256_storeu_ps(m + 4 * ts + 8, c41);
+    _mm256_storeu_ps(m + 5 * ts, c50); _mm256_storeu_ps(m + 5 * ts + 8, c51);
+}
+
+/* Output transform of tile t for channel block ocb, + bias + residual, lrelu.
+ * m: 36 vectors, k-th at m + k*ks. */
+static inline void wino_out_tile(const float* m, size_t ks, const float* bias, __m256 vs,
+                                 const P8* in, P8* out, int t, int tw, int ocb) {
+    int H = in->H, W = in->W;
+    int ty = t / tw, tx = t % tw;
+    int ny = H - 4 * ty < 4 ? H - 4 * ty : 4;
+    int nx = W - 4 * tx < 4 ? W - 4 * tx : 4;
+    __m256 s[4][6];
+    for (int j = 0; j < 6; j++) {
+        WINO_AT(_mm256_loadu_ps(m + (0 * 6 + j) * ks), _mm256_loadu_ps(m + (1 * 6 + j) * ks),
+                _mm256_loadu_ps(m + (2 * 6 + j) * ks), _mm256_loadu_ps(m + (3 * 6 + j) * ks),
+                _mm256_loadu_ps(m + (4 * 6 + j) * ks), _mm256_loadu_ps(m + (5 * 6 + j) * ks),
+                s[0][j], s[1][j], s[2][j], s[3][j]);
+    }
+    __m256 vb = _mm256_loadu_ps(bias + ocb * 8);
+    for (int r = 0; r < ny; r++) {
+        __m256 o[4];
+        WINO_AT(s[r][0], s[r][1], s[r][2], s[r][3], s[r][4], s[r][5], o[0], o[1], o[2], o[3]);
+        const float* res = p8_at(in, ocb, 4 * ty + r + 1, 4 * tx + 1);
+        float* dst = p8_at(out, ocb, 4 * ty + r + 1, 4 * tx + 1);
+        for (int c = 0; c < nx; c++) {
+            __m256 v = _mm256_add_ps(_mm256_add_ps(o[c], vb), _mm256_loadu_ps(res + c * 8));
+            _mm256_storeu_ps(dst + c * 8, lrelu8(v, vs));
+        }
+    }
+}
+
+/* out = lrelu(conv3x3(in) + bias + in), in/out packed P8 with C channels. */
+static void wino_conv_res(const IFBlock* B, const float* U, const float* bias, float slope,
+                          const P8* in, P8* out) {
+    int C = in->C, H = in->H, W = in->W;
+    int ICb = C / 8, nob = C / 16;
+    int th = (H + 3) / 4, tw = (W + 3) / 4, T = th * tw;
+    int NG = (T + 5) / 6;                 /* groups of 6 tiles */
+    __m256 vs = _mm256_set1_ps(slope);
+
+    if (B->global) {
+        /* Few tiles, large weights: transform everything once, then run the GEMMs
+         * split over (k, OC block) so each weight slice is read exactly once. */
+        float* V = B->gV;                  /* [36][NG][ICb][6][8] */
+        float* M = B->gM;                  /* [NG*6][36][C]       */
+        size_t ks = (size_t)NG * ICb * 48;
+        #pragma omp parallel
+        {
+            #pragma omp for collapse(2) schedule(static)
+            for (int t = 0; t < NG * 6; t++) {
+                for (int cb = 0; cb < ICb; cb++) {
+                    float* dst = V + ((size_t)(t / 6) * ICb + cb) * 48 + (t % 6) * 8;
+                    if (t < T) {
+                        wino_in_tile(in, t / tw, t % tw, cb, dst, ks);
+                    } else {
+                        for (int k = 0; k < 36; k++) _mm256_storeu_ps(dst + k * ks, _mm256_setzero_ps());
+                    }
+                }
+            }
+            #pragma omp for collapse(2) schedule(static)
+            for (int k = 0; k < 36; k++) {
+                for (int ob = 0; ob < nob; ob++) {
+                    const float* u = U + ((size_t)k * nob + ob) * C * 16;
+                    for (int gi = 0; gi < NG; gi++)
+                        wino_gemm_6x16(V + k * ks + (size_t)gi * ICb * 48, u, ICb,
+                                       M + ((size_t)(gi * 6) * 36 + k) * C + ob * 16, (size_t)36 * C);
+                }
+            }
+            #pragma omp for collapse(2) schedule(static)
+            for (int t = 0; t < T; t++) {
+                for (int ocb = 0; ocb < C / 8; ocb++)
+                    wino_out_tile(M + (size_t)t * 36 * C + ocb * 8, C, bias, vs, in, out, t, tw, ocb);
+            }
+        }
+        return;
+    }
+
+    int G = B->G, S = B->S;
+    int ntg = (NG + G - 1) / G;           /* tile tasks */
+    int obs = (nob + S - 1) / S;          /* OC blocks per split */
+
+    #pragma omp parallel
+    {
+        float* ws = g_wino_ws + (size_t)omp_get_thread_num() * g_wino_ws_per_thread;
+        float* V = ws;                                      /* [36][G][ICb][6][8] */
+        float* M = ws + (size_t)36 * G * 6 * C;             /* [G*6][36][OCt]     */
+        size_t ks = (size_t)G * ICb * 48;
+
+        #pragma omp for schedule(dynamic, 1)
+        for (int task = 0; task < ntg * S; task++) {
+            int sp = task / ntg, tg = task % ntg;
+            int g0 = tg * G, gn = (NG - g0) < G ? (NG - g0) : G;
+            int ob0 = sp * obs, ob1 = ob0 + obs < nob ? ob0 + obs : nob;
+            if (ob0 >= ob1) continue;
+            int OCt = (ob1 - ob0) * 16;
+
+            for (int gi = 0; gi < gn; gi++) {
+                for (int jt = 0; jt < 6; jt++) {
+                    int t = (g0 + gi) * 6 + jt;
+                    for (int cb = 0; cb < ICb; cb++) {
+                        float* dst = V + ((size_t)gi * ICb + cb) * 48 + jt * 8;
+                        if (t < T) {
+                            wino_in_tile(in, t / tw, t % tw, cb, dst, ks);
+                        } else {
+                            for (int k = 0; k < 36; k++) _mm256_storeu_ps(dst + k * ks, _mm256_setzero_ps());
+                        }
+                    }
+                }
+            }
+            for (int k = 0; k < 36; k++) {
+                for (int ob = ob0; ob < ob1; ob++) {
+                    const float* u = U + ((size_t)k * nob + ob) * C * 16;
+                    for (int gi = 0; gi < gn; gi++)
+                        wino_gemm_6x16(V + k * ks + (size_t)gi * ICb * 48, u, ICb,
+                                       M + ((size_t)(gi * 6) * 36 + k) * OCt + (ob - ob0) * 16, (size_t)36 * OCt);
+                }
+            }
+            for (int tl = 0; tl < gn * 6; tl++) {
+                int t = g0 * 6 + tl;
+                if (t >= T) break;
+                for (int ocb = ob0 * 2; ocb < ob1 * 2; ocb++)
+                    wino_out_tile(M + (size_t)tl * 36 * OCt + (ocb - ob0 * 2) * 8, OCt, bias, vs, in, out, t, tw, ocb);
+            }
+        }
+    }
+}
+
+/* ---------- block setup / execution ---------- */
+
+static IFBlock* ifblock_create(const Layer* L0a, const Layer* L0b, const Layer* const res[8], const Layer* Ld) {
+    IFBlock* B = (IFBlock*)calloc(1, sizeof(IFBlock));
+    B->conv0a = *L0a; B->conv0b = *L0b; B->deconv = *Ld;
+    for (int i = 0; i < 8; i++) B->res[i] = *res[i];
+    B->c0 = L0a->num_output;
+    B->c = L0b->num_output;
+    assert(B->c0 % 16 == 0 && B->c % 16 == 0);
+
+    /* stride-2 weights come in as [OC/8][C][9][8]; repack to [OC/16][C][9][16] */
+    const Layer* s2[2] = { L0a, L0b };
+    float** dst[2] = { &B->w0a, &B->w0b };
+    for (int q = 0; q < 2; q++) {
+        int OC = s2[q]->num_output, C = s2[q]->weight_data_size / (OC * 9);
+        float* w = (float*)aligned_alloc(64, ((size_t)OC * C * 9 * sizeof(float) + 63) & ~(size_t)63);
+        for (int ob = 0; ob < OC / 16; ob++)
+            for (int c = 0; c < C; c++)
+                for (int k = 0; k < 9; k++)
+                    for (int s = 0; s < 16; s++)
+                        w[(((size_t)ob * C + c) * 9 + k) * 16 + s] =
+                            s2[q]->weights[((((size_t)ob * 2 + s / 8) * C + c) * 9 + k) * 8 + s % 8];
+        *dst[q] = w;
+    }
+    for (int i = 0; i < 8; i++) {
+        assert(res[i]->num_output == B->c && res[i]->weight_data_size == B->c * B->c * 9);
+        B->U[i] = wino_weights(res[i]->weights, B->c, B->c);
+    }
+    return B;
+}
+
+/* Allocate buffers for an input of in_w x in_h, choose task shape, and grow the
+ * shared Winograd workspace. Called during setup (outside parallel regions). */
+static void ifblock_prepare(IFBlock* B, int in_w, int in_h) {
+    B->in_w = in_w; B->in_h = in_h;
+    int W1 = (in_w - 1) / 2 + 1, H1 = (in_h - 1) / 2 + 1;
+    int W2 = (W1 - 1) / 2 + 1, H2 = (H1 - 1) / 2 + 1;
+    p8_alloc(&B->a, B->c0, H1, W1);
+    p8_alloc(&B->x, B->c, H2, W2);
+    p8_alloc(&B->y, B->c, H2, W2);
+
+    int C = B->c, nob = C / 16;
+    int T = ((H2 + 3) / 4) * ((W2 + 3) / 4), NG = (T + 5) / 6;
+    int nt = omp_get_max_threads();
+    /* keep V + M for one task around 256 KB (L2 is 512 KB on Zen 2) */
+    size_t per_group = (size_t)36 * 6 * (C + C) * sizeof(float);
+    int G = (int)((256 * 1024) / per_group);
+    if (G < 1) G = 1;
+    if (G > 4) G = 4;
+    while (G > 1 && (NG + G - 1) / G < 3 * nt) G--;
+    /* Split OC so each split's weights (~2 MB) stay in L3 while all threads
+     * work through it (tasks are ordered split-major), and for parallelism. */
+    size_t u_all = (size_t)36 * C * C * sizeof(float);
+    int S = (int)((u_all + (2u << 20) - 1) / (2u << 20));
+    if (S > nob) S = nob;
+    while (S < nob && ((NG + G - 1) / G) * S < 3 * nt) S++;
+    B->G = G; B->S = S;
+
+    /* Weights larger than what one task should stream, and few enough tiles
+     * that transforming them all at once stays cache-friendly. */
+    size_t u_bytes = (size_t)36 * C * C * sizeof(float);
+    size_t v_bytes = (size_t)36 * NG * 6 * C * sizeof(float);
+    B->global = u_bytes > 2 * v_bytes;
+    const char* env = getenv("RIFE_WINO_GLOBAL");
+    if (env) B->global = atoi(env);
+    if (B->global) {
+        B->gV = (float*)aligned_alloc(64, (v_bytes + 63) & ~(size_t)63);
+        B->gM = (float*)aligned_alloc(64, (v_bytes + 63) & ~(size_t)63);
+        assert(B->gV && B->gM);
+    }
+
+    size_t need = (size_t)36 * G * 6 * C * 2;
+    if (need > g_wino_ws_per_thread) {
+        free(g_wino_ws);
+        g_wino_ws_per_thread = need;
+        g_wino_ws = (float*)aligned_alloc(64, (need * nt * sizeof(float) + 63) & ~(size_t)63);
+        assert(g_wino_ws);
+    }
+}
+
+static void ifblock_forward(IFBlock* B, const Tensor* in, Tensor* out) {
+    assert(in->is_padded && in->w == B->in_w && in->h == B->in_h);
+    /* conv0a: planar padded input -> a */
+    conv3x3s2_p8(in->data, 1, (size_t)(in->h + 2) * (in->w + 2), in->w + 2, in->c,
+                 B->w0a, B->conv0a.bias, B->conv0a.act_params[0], &B->a);
+    /* conv0b: a -> x */
+    conv3x3s2_p8(B->a.data, 8, p8_plane(&B->a), B->a.PW, B->c0,
+                 B->w0b, B->conv0b.bias, B->conv0b.act_params[0], &B->x);
+    /* 8 residual convs, ping-pong x <-> y */
+    P8* cur = &B->x;
+    P8* nxt = &B->y;
+    for (int i = 0; i < 8; i++) {
+        wino_conv_res(B, B->U[i], B->res[i].bias, B->res[i].act_params[0], cur, nxt);
+        P8* t = cur; cur = nxt; nxt = t;
+    }
+    /* deconv: packed -> HWC scratch -> deconv core (+ pixelshuffle) */
+    int C = cur->C, H = cur->H, W = cur->W;
+    scratch_check((size_t)C * H * W, B->deconv.name);
+    float* hwc = g_pin_scratch;
+    #pragma omp parallel for schedule(static)
+    for (int h = 0; h < H; h++) {
+        for (int w = 0; w < W; w++) {
+            float* d = hwc + ((size_t)h * W + w) * C;
+            for (int cb = 0; cb < C / 8; cb++)
+                _mm256_storeu_ps(d + cb * 8, _mm256_loadu_ps(p8_at(cur, cb, h + 1, w + 1)));
+        }
+    }
+    deconv_core(&B->deconv, hwc, W, H, C, out);
+}
+
+/* Replace each conv s2, conv s2, 8 x fused res conv, deconv(+ps) run with one LT_IFBLOCK. */
+static void fuse_ifblocks(Graph* g) {
+    int fused = 0;
+    for (int i = 0; i < g->n_layers; i++) {
+        if (g->layers[i].type != LT_CONV || g->layers[i].stride != 2) continue;
+        int idx[11], n = 0;
+        for (int j = i; j < g->n_layers && n < 11; j++) {
+            LayerType t = g->layers[j].type;
+            if (t == LT_SPLIT || t == LT_NOP) continue;
+            idx[n++] = j;
+        }
+        if (n < 11) continue;
+        Layer* L = g->layers;
+        int ok = L[idx[1]].type == LT_CONV && L[idx[1]].stride == 2 &&
+                 L[idx[0]].act_type == 2 && L[idx[1]].act_type == 2 &&
+                 L[idx[10]].type == LT_DECONV && L[idx[10]].upscale == 2;
+        for (int r = 0; r < 8 && ok; r++) {
+            const Layer* R = &L[idx[2 + r]];
+            ok = R->type == LT_CONV && R->stride == 1 && R->kernel == 3 && R->res_blob_idx >= 0 && R->act_type != 0;
+        }
+        if (!ok) continue;
+        const Layer* res[8];
+        for (int r = 0; r < 8; r++) res[r] = &L[idx[2 + r]];
+        /* blobs produced inside the block (conv outputs and the splits of them) */
+        int inner[64], n_inner = 0;
+        for (int q = 0; q < 10; q++) inner[n_inner++] = L[idx[q]].out_idx[0];
+        for (int j = idx[0] + 1; j < idx[10]; j++) {
+            if (L[j].type != LT_SPLIT) continue;
+            for (int q = 0; q < n_inner; q++) {
+                if (L[j].in_idx[0] == inner[q]) {
+                    for (int o = 0; o < L[j].out_count && n_inner < 64; o++) inner[n_inner++] = L[j].out_idx[o];
+                    L[j].type = LT_NOP;   /* dead once the block is fused */
+                    break;
+                }
+            }
+        }
+        IFBlock* B = ifblock_create(&L[idx[0]], &L[idx[1]], res, &L[idx[10]]);
+        Layer* head = &L[idx[0]];
+        head->type = LT_IFBLOCK;
+        head->ifb = B;
+        head->out_idx[0] = L[idx[10]].out_idx[0];
+        for (int q = 1; q < 11; q++) L[idx[q]].type = LT_NOP;
+        fused++;
+        i = idx[10];
+    }
+    printf("Fused %d IFBlocks (Winograd F(4x4,3x3) residual convs)\n", fused);
 }
 
 /* =====================  GRAPH OPTIMIZATION PASSES  ===================== */
@@ -2005,21 +2542,25 @@ static void graph_execute(const Graph* g, Tensor* blobs) {
             case LT_SIGMOID:
                 sigmoid_forward(&blobs[L->in_idx[0]], &blobs[L->out_idx[0]]);
                 break;
+            case LT_IFBLOCK:
+                ifblock_forward(L->ifb, &blobs[L->in_idx[0]], &blobs[L->out_idx[0]]);
+                break;
         }
         clock_gettime(CLOCK_MONOTONIC, &t1);
         type_times[L->type] += (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) * 1e-6;
     }
     const char* type_names[] = {
         "Input", "Split", "Concat", "Interp", "Conv", "Deconv", "ReLU",
-        "BinaryOp", "PixelShuffle", "Crop", "Warp", "Eltwise", "Sigmoid"
+        "BinaryOp", "PixelShuffle", "Crop", "Warp", "Eltwise", "Sigmoid", "Nop", "IFBlock"
     };
-    for (int t = 0; t < 13; t++) {
+    static int profile = -1;
+    if (profile < 0) profile = getenv("RIFE_PROFILE") != NULL;
+    if (!profile) return;
+    for (int t = 0; t < 15; t++) {
         if (type_times[t] > 0.01) {
             printf("  %-14s: %6.2f ms\n", type_names[t], type_times[t]);
         }
     }
-    printf("    -> Conv S=1: %6.2f ms, Conv S=2: %6.2f ms, Conv Pad: %6.2f ms\n",
-           s1_time, s2_time, pad_time);
 }
 
 /* =====================  IMAGE I/O (stb)  ===================== */
@@ -2099,6 +2640,7 @@ int main(int argc, char** argv) {
 
     fuse_resblocks(&g);
     fuse_deconv_pixelshuffle(&g);
+    fuse_ifblocks(&g);
 
     int w, h;
     Tensor img0 = load_image_rgb(img0_path, &w, &h);
@@ -2173,6 +2715,13 @@ int main(int argc, char** argv) {
                     oc /= 4;
                 }
                 break;
+            case LT_IFBLOCK: {
+                int w1 = (iw - 1) / 2 + 1, h1 = (ih - 1) / 2 + 1;
+                int w2 = (w1 - 1) / 2 + 1, h2 = (h1 - 1) / 2 + 1;
+                ow = 4 * w2; oh = 4 * h2;
+                oc = L->ifb->deconv.num_output / 4;
+                break;
+            }
             case LT_RELU:
             case LT_SIGMOID:
             case LT_WARP:
@@ -2224,6 +2773,8 @@ int main(int argc, char** argv) {
         if (L->type == LT_CONV) {
             blob_is_padded[L->out_idx[0]] = 1;
             blob_is_padded[L->in_idx[0]] = 1;
+        } else if (L->type == LT_IFBLOCK) {
+            blob_is_padded[L->in_idx[0]] = 1;
         }
     }
 
@@ -2272,6 +2823,9 @@ int main(int argc, char** argv) {
             need = (size_t)in->c * (in->h + 2) * (in->w + 2);
         } else if (L->type == LT_DECONV) {
             need = (size_t)in->c * in->h * in->w;
+        } else if (L->type == LT_IFBLOCK) {
+            ifblock_prepare(L->ifb, in->w, in->h);
+            need = (size_t)L->ifb->x.C * L->ifb->x.H * L->ifb->x.W;
         }
         if (need > scratch_need) scratch_need = need;
     }
