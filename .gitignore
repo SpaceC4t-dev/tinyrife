@@ -1,13 +1,9 @@
-__pycache__/
+build/
 ext/
+__pycache__/
 inputs/
 outputs/
 *.webm
 *.mp4
-rife_v46
-bench_ncnn
-out.png
-ref_out.png
 *.o
 *.bak
-rife_gl

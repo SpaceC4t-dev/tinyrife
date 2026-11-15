@@ -1,5 +1,10 @@
 """Minimal reader for the ncnn .param/.bin pair of rife-v4.6 (Convolution / Deconvolution layers only)."""
+import os
 import numpy as np
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # repo root (this file is in python/)
+DEFAULT_MODEL = os.path.join(ROOT, "ext/rife-ncnn-vulkan/models/rife-v4.6")   # from fetch_model.sh
+SCALES = (8, 4, 2, 1)   # input downscale of the four IFBlocks
 
 FP16_TAG, FP32_TAG = 0x01306B47, 0x00000000
 

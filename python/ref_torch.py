@@ -1,7 +1,6 @@
 """Independent PyTorch reference of the rife-v4.6 graph (stock torch ops), used to validate the OpenGL port."""
 import os, torch, torch.nn.functional as F
-from ncnn_weights import load_ncnn
-from gl_rife import DEFAULT_MODEL, SCALES
+from ncnn_weights import load_ncnn, DEFAULT_MODEL, SCALES
 
 def tw(a): return torch.from_numpy(a)
 

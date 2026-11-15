@@ -3,8 +3,8 @@ Runs directory mode with two sequence lengths and takes the slope per actual mod
 import os, re, subprocess, sys, time, tempfile, numpy as np
 from PIL import Image
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-BIN_DIR = os.path.join(HERE, "ext/ncnn-bin/rife-ncnn-vulkan-20221029-ubuntu")
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BIN_DIR = os.path.join(ROOT, "ext/ncnn-bin/rife-ncnn-vulkan-20221029-ubuntu")
 SRC = "/usr/share/wallpapers/openSUSEdefault/contents/images/1920x1200.png"
 
 def make_frames(d, n, w, h):

@@ -1,0 +1,12 @@
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, binding = 3) writeonly buffer Out { uint outp[]; };
+void main() {
+  int x = int(gl_GlobalInvocationID.x), y = int(gl_GlobalInvocationID.y);
+  if (x >= W || y >= H) return;
+  int o = y * W + x;
+  vec4 f = flow[o];
+  float m = 1.0 / (1.0 + exp(-mask[o]));
+  vec3 r = warp0(x, y, f.xy) * m + warp1(x, y, f.zw) * (1.0 - m);
+  outp[o] = packUnorm4x8(vec4(r, 1.0));
+}

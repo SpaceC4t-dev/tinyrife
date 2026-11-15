@@ -1,0 +1,31 @@
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(std430, binding = 3) writeonly buffer Out { vec4 outp[]; };
+uniform float timestep;
+void main() {
+  int X = int(gl_GlobalInvocationID.x), Y = int(gl_GlobalInvocationID.y);
+  if (X >= WO || Y >= HO) return;
+  vec4 a = vec4(0.0), b = vec4(0.0), c = vec4(0.0);
+#if S == 1
+  const int NT = 1, OFF = 0;
+#else
+  const int NT = 2, OFF = S / 2 - 1;
+#endif
+  for (int ty = 0; ty < NT; ty++) for (int tx = 0; tx < NT; tx++) {
+    int x = X * S + OFF + tx, y = Y * S + OFF + ty;
+#if FIRST
+    vec4 p0 = px0(x, y), p1 = px1(x, y);
+    a += vec4(p0.rgb, p1.r); b += vec4(p1.gb, timestep, 0.0);
+#else
+    vec4 f = flow[y * W + x];
+    vec3 w0 = warp0(x, y, f.xy), w1 = warp1(x, y, f.zw);
+    a += vec4(w0, w1.r); b += vec4(w1.gb, timestep, mask[y * W + x]); c += f;
+#endif
+  }
+  float inv = 1.0 / float(NT * NT);
+  int n = HO * WO, o = Y * WO + X;
+  outp[o] = a * inv; outp[n + o] = b * inv;
+#if !FIRST
+  outp[2 * n + o] = c * (inv / float(S));
+#endif
+}

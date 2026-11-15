@@ -1,0 +1,15 @@
+
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, binding = 3) writeonly buffer Dst { uint dst[]; };
+void main() {
+  int t = int(gl_GlobalInvocationID.x), p0 = t * 4, n = IW * IH;
+  if (p0 >= n) return;
+  uint b[12];
+  for (int k = 0; k < 4; k++) {
+    int p = p0 + k;
+    uint v = p < n ? src[(p / IW) * W + p % IW] : 0u;
+    b[3 * k] = v & 0xffu; b[3 * k + 1] = (v >> 8) & 0xffu; b[3 * k + 2] = (v >> 16) & 0xffu;
+  }
+  for (int j = 0; j < 3; j++) dst[t * 3 + j] = b[4 * j] | (b[4 * j + 1] << 8) | (b[4 * j + 2] << 16) | (b[4 * j + 3] << 24);
+}

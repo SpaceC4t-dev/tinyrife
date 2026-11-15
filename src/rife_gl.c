@@ -1,10 +1,10 @@
 /* RIFE v4.6 frame interpolation on OpenGL 4.3 compute shaders, host side in C.
  *
- * Same shaders and buffer layout as ../gl_rife.py (shaders.h is generated from it). No GL/EGL headers or link-time
+ * Same shaders and buffer layout as the GLSL in shaders/ (embedded at build time as build/shaders.h). No GL/EGL headers or link-time
  * dependencies: libEGL is dlopen()ed and every GL entry point comes from eglGetProcAddress.
  *
- * Build:  gcc -O2 rife_gl.c -o rife_gl -ldl -lm
- * Usage:  rife_gl [-m model_dir] [-t timestep] [-b N] frame0.png frame1.png out.png
+ * Build:  make build/rife_gl
+ * Usage:  build/rife_gl [-m model_dir] [-t timestep] [-b N] frame0.png frame1.png out.png
  *         (model_dir holds flownet.param/.bin; -b N additionally times N GPU runs)
  */
 #include <dlfcn.h>
@@ -18,8 +18,8 @@
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_IMPLEMENTATION
-#include "../cpu/stb_image.h"
-#include "../cpu/stb_image_write.h"
+#include "stb_image.h"
+#include "stb_image_write.h"
 #include "shaders.h"
 
 #define DEFAULT_MODEL "ext/rife-ncnn-vulkan/models/rife-v4.6"
@@ -87,6 +87,9 @@ static void die(const char *fmt, ...) {
   exit(1);
 }
 
+static struct { EGLDisplay dpy; EGLContext ctx; EGLBoolean (*make_current)(EGLDisplay, EGLSurface, EGLSurface, EGLContext);
+                EGLBoolean (*destroy_context)(EGLDisplay, EGLContext); EGLBoolean (*terminate)(EGLDisplay); } g_egl;
+
 static void gl_init(void) {
   void *lib = dlopen("libEGL.so.1", RTLD_NOW | RTLD_GLOBAL);
   if (!lib) die("cannot load libEGL.so.1");
@@ -97,6 +100,8 @@ static void gl_init(void) {
   EGLContext (*createContext)(EGLDisplay, EGLConfig, EGLContext, const EGLint *) = dlsym(lib, "eglCreateContext");
   EGLBoolean (*makeCurrent)(EGLDisplay, EGLSurface, EGLSurface, EGLContext) = dlsym(lib, "eglMakeCurrent");
   void *(*getProc)(const char *) = dlsym(lib, "eglGetProcAddress");
+  EGLBoolean (*destroyContext)(EGLDisplay, EGLContext) = dlsym(lib, "eglDestroyContext");
+  EGLBoolean (*terminate)(EGLDisplay) = dlsym(lib, "eglTerminate");
   if (!getDisplay || !initialize || !bindAPI || !chooseConfig || !createContext || !makeCurrent || !getProc)
     die("libEGL is missing required entry points");
 
@@ -113,11 +118,21 @@ static void gl_init(void) {
   EGLContext ctx = createContext(dpy, cfg, NULL, ctx_attr);
   if (!ctx) die("cannot create an OpenGL 4.3 core context");
   if (!makeCurrent(dpy, NULL, NULL, ctx)) die("eglMakeCurrent failed");
+  g_egl.dpy = dpy, g_egl.ctx = ctx, g_egl.make_current = makeCurrent, g_egl.destroy_context = destroyContext, g_egl.terminate = terminate;
 
 #define X(ret, name, args)                                                                                             \
   if (!(gl##name = (ret(*) args)getProc("gl" #name))) die("missing GL function gl" #name);
   GL_FUNCS(X)
 #undef X
+}
+
+/* Release the context so the driver frees its own state (all GL objects go with it). */
+static void gl_shutdown(void) {
+  if (!g_egl.dpy) return;
+  g_egl.make_current(g_egl.dpy, NULL, NULL, NULL);
+  if (g_egl.destroy_context) g_egl.destroy_context(g_egl.dpy, g_egl.ctx);
+  if (g_egl.terminate) g_egl.terminate(g_egl.dpy);
+  g_egl.dpy = NULL;
 }
 
 /* ------------------------------------------------------------------ ncnn weights */
@@ -134,9 +149,12 @@ static void *slurp(const char *path, size_t *len) {
   if (!f) die("cannot open %s", path);
   fseek(f, 0, SEEK_END);
   long n = ftell(f);
+  if (n < 0) die("cannot determine the size of %s", path);
   fseek(f, 0, SEEK_SET);
-  void *p = malloc(n + 1);
+  void *p = malloc((size_t)n + 1);
+  if (!p) die("out of memory reading %s", path);
   if (fread(p, 1, n, f) != (size_t)n) die("short read on %s", path);
+  // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound) p has n+1 bytes (n checked >= 0 above)
   ((char *)p)[n] = 0;
   fclose(f);
   if (len) *len = n;
@@ -157,15 +175,16 @@ static void load_ncnn(const char *dir, Layer *L) {
   snprintf(path, sizeof path, "%s/flownet.bin", dir);
   size_t blen;
   uint8_t *blob = slurp(path, &blen);
-  if (strncmp(param, "7767517", 7)) die("not an ncnn param file");
+  if (strncmp(param, "7767517", 7) != 0) die("not an ncnn param file");
   size_t off = 0;
   int nl = 0;
-  char *save, *line = strtok_r(param, "\n", &save);
-  for (line = strtok_r(NULL, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) { /* skip magic; next is counts */
+  char *save;
+  (void)strtok_r(param, "\n", &save);   /* the magic line */
+  for (char *line = strtok_r(NULL, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) { /* next is the counts line, skipped below */
     char type[64], name[128];
     int nin, nout, used;
     if (sscanf(line, "%63s %127s %d %d%n", type, name, &nin, &nout, &used) < 4) continue;
-    if (strcmp(type, "Convolution") && strcmp(type, "Deconvolution")) continue;
+    if (strcmp(type, "Convolution") != 0 && strcmp(type, "Deconvolution") != 0) continue;
     char *p = line + used;
     for (int i = 0; i < nin + nout; i++) { /* skip blob names */
       while (*p == ' ') p++;
@@ -182,13 +201,19 @@ static void load_ncnn(const char *dir, Layer *L) {
       if (key == 5) has_bias = (int)val;
       if (key == 6) wsize = val;
     }
+    if (outc <= 0 || k <= 0 || wsize <= 0 || wsize > (1L << 28) || wsize % ((long)outc * k * k))
+      die("%s: bad convolution parameters in %s/flownet.param", name, dir);
     if (nl >= N_LAYERS) die("unexpected layer count in %s (expected %d conv layers)", dir, N_LAYERS);
     Layer *l = &L[nl++];
     l->outc = outc, l->k = k, l->inc = (int)(wsize / ((long)outc * k * k));
-    l->w = malloc(wsize * sizeof(float));
+    l->w = malloc((size_t)wsize * sizeof(float));
+    if (!l->w) die("out of memory");
+#define NEED(n) do { if ((size_t)(n) > blen - off) die("%s: truncated weights in %s/flownet.bin", name, dir); } while (0)
     uint32_t tag;
+    NEED(4);
     memcpy(&tag, blob + off, 4), off += 4;
     if (tag == 0x01306B47u) {
+      NEED(((size_t)wsize * 2 + 3) / 4 * 4);
       for (long i = 0; i < wsize; i++) {
         uint16_t h;
         memcpy(&h, blob + off + 2 * i, 2);
@@ -196,12 +221,17 @@ static void load_ncnn(const char *dir, Layer *L) {
       }
       off += ((size_t)wsize * 2 + 3) / 4 * 4;
     } else if (tag == 0) {
-      memcpy(l->w, blob + off, wsize * 4), off += wsize * 4;
+      NEED((size_t)wsize * 4);
+      memcpy(l->w, blob + off, (size_t)wsize * 4), off += (size_t)wsize * 4;
     } else {
       die("%s: unsupported weight tag 0x%x", name, tag);
     }
     l->b = calloc(outc, sizeof(float));
-    if (has_bias) memcpy(l->b, blob + off, outc * 4), off += outc * 4;
+    if (has_bias) {
+      NEED((size_t)outc * 4);
+      memcpy(l->b, blob + off, (size_t)outc * 4), off += (size_t)outc * 4;
+    }
+#undef NEED
   }
   if (nl != N_LAYERS) die("found %d conv layers, expected %d", nl, N_LAYERS);
   if (off != blen) die("consumed %zu of %zu weight bytes -- layout mismatch", off, blen);
@@ -245,11 +275,13 @@ typedef struct {
 
 /* Compile `body` with "#define NAME value" lines for each name/value pair (NULL-terminated). */
 static GLuint get_prog(Rife *r, const char *body, const char *const *defs, const int *vals) {
-  size_t cap = strlen(body) + 64 * 32;
-  char *src = malloc(cap), *p = src;
-  p += sprintf(p, "#version 430\n#define W %d\n#define H %d\n", r->W, r->H);
-  for (int i = 0; defs[i]; i++) p += sprintf(p, "#define %s %d\n", defs[i], vals[i]);
-  strcpy(p, body);
+  size_t blen = strlen(body), cap = blen + 64 * 32, used = 0;
+  char *src = malloc(cap);
+  if (!src) die("out of memory");
+  used += (size_t)snprintf(src, cap, "#version 430\n#define W %d\n#define H %d\n", r->W, r->H);
+  for (int i = 0; defs[i] && used < cap; i++) used += (size_t)snprintf(src + used, cap - used, "#define %s %d\n", defs[i], vals[i]);
+  if (used + blen + 1 > cap) die("shader source buffer too small");
+  memcpy(src + used, body, blen + 1);
   for (int i = 0; i < r->nprogs; i++)
     if (!strcmp(r->progs[i].src, src)) { free(src); return r->progs[i].prog; }
   GLuint sh = glCreateShader(GL_COMPUTE_SHADER);
@@ -395,6 +427,12 @@ static Rife *rife_new(int h, int w, const char *model_dir) {
   return r;
 }
 
+/* Host-side memory only; GL buffers and programs go away with the context at process exit. */
+static void rife_free(Rife *r) {
+  for (int i = 0; i < r->nprogs; i++) free(r->progs[i].src);
+  free(r);
+}
+
 /* ------------------------------------------------------------------ runtime */
 
 /* Upload the next frame (tight RGB24). Interpolation runs between the last two pushed frames. */
@@ -499,6 +537,12 @@ int main(int argc, char **argv) {
     double e2e = (now_ms() - t0) / bench;
     printf("GL(C) %dx%d (padded %dx%d): gpu %.1f ms (%.2f fps) | end-to-end %.1f ms (%.2f fps)\n", w, h, r->W, r->H,
            gpu[bench / 2], 1e3 / gpu[bench / 2], e2e, 1e3 / e2e);
+    free(gpu);
   }
+  free(out);
+  rife_free(r);
+  gl_shutdown();
+  stbi_image_free(a);
+  stbi_image_free(b);
   return 0;
 }

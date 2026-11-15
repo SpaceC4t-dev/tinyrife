@@ -1,0 +1,43 @@
+
+layout(local_size_x = LX, local_size_y = LY, local_size_z = 1) in;
+layout(std430, binding = 0) readonly buffer In  { vec4 inp[]; };
+layout(std430, binding = 1) readonly buffer Wt  { mat4 wt[]; };    // [oc4][ic4][9], column i = input ch i
+layout(std430, binding = 2) readonly buffer Bs  { vec4 bias[]; };  // [oc4]
+layout(std430, binding = 3) writeonly buffer Out { vec4 outp[]; };
+
+void main() {
+  int ox0 = int(gl_GlobalInvocationID.x) * PX;
+  int oy = int(gl_GlobalInvocationID.y);
+  int og0 = int(gl_WorkGroupID.z) * OT;          // workgroup-uniform -> scalar weight loads
+  if (oy >= HO || ox0 >= WO) return;
+  vec4 acc[OT][PX];
+  for (int t = 0; t < OT; t++) for (int p = 0; p < PX; p++) acc[t][p] = bias[og0 + t];
+  for (int ic = 0; ic < IC4; ic++) {
+    for (int ky = 0; ky < 3; ky++) {
+      int iy = oy * S - 1 + ky;
+      if (iy < 0 || iy >= HI) continue;
+      int rowbase = (ic * HI + iy) * WI;
+      for (int kx = 0; kx < 3; kx++) {
+        vec4 v[PX];
+        for (int p = 0; p < PX; p++) {
+          int ix = (ox0 + p) * S - 1 + kx;
+          v[p] = (ix >= 0 && ix < WI) ? inp[rowbase + ix] : vec4(0.0);
+        }
+        for (int t = 0; t < OT; t++) {
+          mat4 w = wt[((og0 + t) * IC4 + ic) * 9 + ky * 3 + kx];
+          for (int p = 0; p < PX; p++) acc[t][p] += w * v[p];
+        }
+      }
+    }
+  }
+  for (int t = 0; t < OT; t++) for (int p = 0; p < PX; p++) {
+    int ox = ox0 + p;
+    if (ox >= WO) break;
+    int o = ((og0 + t) * HO + oy) * WO + ox;
+    vec4 r = acc[t][p];
+#if RESID
+    r += inp[o];
+#endif
+    outp[o] = max(r, 0.2 * r);
+  }
+}

@@ -1,8 +1,0 @@
-rife_v46
-bench_ncnn
-out.png
-ref_out.png
-*.o
-*.bak
-__pycache__/
-

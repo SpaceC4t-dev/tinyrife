@@ -10,7 +10,7 @@ from PIL import Image
 
 torch.set_grad_enabled(False)
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+from ncnn_weights import load_ncnn, DEFAULT_MODEL, ROOT
 
 def conv(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilation=1):
     return nn.Sequential(
@@ -121,8 +121,6 @@ class IFNet(nn.Module):
 
 def load_ncnn_weights(model, param_path, bin_path):
     """Load the repo's ncnn flownet-v46 weights (ResConv beta is already folded into the conv weights)."""
-    sys.path.insert(0, os.path.join(HERE, ".."))
-    from ncnn_weights import load_ncnn
     layers = load_ncnn(param_path, bin_path)
     for bi, blk in enumerate([model.block0, model.block1, model.block2, model.block3]):
         L = layers[bi * 11:(bi + 1) * 11]
@@ -191,11 +189,11 @@ def run_bench(args):
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description="Benchmark Practical-RIFE v4.6 (PyTorch CPU) on one frame pair")
-    ap.add_argument('--frame0', default=os.path.join(HERE, 'frame0.png'))
-    ap.add_argument('--frame1', default=os.path.join(HERE, 'frame1.png'))
-    ap.add_argument('--weights', help="Practical-RIFE flownet_v4.6.pkl; default: the ncnn weights next to this script")
-    ap.add_argument('--ncnn-param', default=os.path.join(HERE, 'flownet-v46.param'))
-    ap.add_argument('--ncnn-bin', default=os.path.join(HERE, 'flownet-v46.bin'))
+    ap.add_argument('--frame0', default=os.path.join(ROOT, 'data/frame0.png'))
+    ap.add_argument('--frame1', default=os.path.join(ROOT, 'data/frame1.png'))
+    ap.add_argument('--weights', help="Practical-RIFE flownet_v4.6.pkl; default: the ncnn weights from fetch_model.sh")
+    ap.add_argument('--ncnn-param', default=os.path.join(DEFAULT_MODEL, 'flownet.param'))
+    ap.add_argument('--ncnn-bin', default=os.path.join(DEFAULT_MODEL, 'flownet.bin'))
     ap.add_argument('--threads', type=int, default=4)
     ap.add_argument('--iters', type=int, default=10)
     ap.add_argument('--out', help="save the interpolated frame here")

@@ -3,8 +3,8 @@
  *   Input:  two RGB images (HxWx3, uint8) + timestep in [0,1]
  *   Output: interpolated RGB image (HxWx3, uint8)
  *
- * Build:  gcc -O3 -march=native -fopenmp rife_v46.c -o rife_v46 -lm
- * Run:    ./rife_v46 [--pad 32|64] flownet-v46.bin frame0.png frame1.png 0.5 out.png [iterations]
+ * Build:  make build/rife_cpu
+ * Run:    build/rife_cpu [--pad 32|64] ext/rife-ncnn-vulkan/models/rife-v4.6/flownet.bin frame0.png frame1.png 0.5 out.png [iterations]
  *
  * --pad sets the multiple the frame is zero-padded to (default 32, as in
  * rife-ncnn-vulkan). --pad 64 matches Practical-RIFE's inference scripts.
@@ -138,6 +138,7 @@ static void deconv_core(const float* wt_reord, const float* B, const float* in_h
                         int iw1 = (ow1 + 1 - kw) >> 1;
 
                         const float* wt_p = wt_reord + ((size_t)(kh * 4 + kw) * C) * 24;
+                        // NOLINTNEXTLINE(clang-analyzer-core.NullPointerArithm) in_hwc is the shared workspace, allocated in ifblock_prepare before any forward pass
                         const float* in0 = ((unsigned)iw0 < (unsigned)W) ? (in_row + (size_t)iw0 * C) : NULL;
                         const float* in1 = ((unsigned)iw1 < (unsigned)W) ? (in_row + (size_t)iw1 * C) : NULL;
 
@@ -262,8 +263,10 @@ static void deconv_core(const float* wt_reord, const float* B, const float* in_h
                         if ((unsigned)iw >= (unsigned)W) continue;
 
                         const float* wt_p = wt_reord + ((size_t)(kh * 4 + kw) * C) * 24;
+                        // NOLINTNEXTLINE(clang-analyzer-core.NullPointerArithm) in_hwc is the shared workspace, allocated in ifblock_prepare before any forward pass
                         const float* in_p = in_row + (size_t)iw * C;
                         for (int c = 0; c < C; c += 2) {
+                            // NOLINTNEXTLINE(clang-analyzer-core.NullDereference) in_hwc is the shared workspace, allocated in ifblock_prepare before any forward pass
                             __m256 v0 = _mm256_set1_ps(in_p[c + 0]);
                             __m256 v1 = _mm256_set1_ps(in_p[c + 1]);
 
@@ -356,6 +359,7 @@ static void interp_forward(const Tensor* in, Tensor* out, float scale) {
             float* out_row = out->data + (size_t)c * out_ch_sz + (size_t)(out->is_padded ? (dy + 1) : dy) * out_pw + out_col_base;
             int dx = 0;
             for (; dx <= OW - 4; dx += 4) {
+                // NOLINTNEXTLINE(clang-analyzer-core.uninitialized.Assign) xofs[] is filled for every index below OW above
                 int sx0 = xofs[dx + 0], sx1 = xofs[dx + 1], sx2 = xofs[dx + 2], sx3 = xofs[dx + 3];
                 float a0_0 = alpha[(dx + 0) * 2 + 0], a1_0 = alpha[(dx + 0) * 2 + 1];
                 float a0_1 = alpha[(dx + 1) * 2 + 0], a1_1 = alpha[(dx + 1) * 2 + 1];
@@ -638,6 +642,7 @@ static void detect_caches(void) {
         }
     }
     printf("Caches: L2 %zu KB/core, L3 %zu KB x %zu (%zu KB total)\n", g_cache.l2 >> 10,
+           // NOLINTNEXTLINE(clang-analyzer-core.DivideZero) l3_slice is never 0: detection and RIFE_CACHE both reject zero sizes
            g_cache.l3_slice >> 10, g_cache.l3_total / g_cache.l3_slice, g_cache.l3_total >> 10);
 }
 
@@ -1487,13 +1492,25 @@ static Net* net_create(const char* bin_path, int w, int h, float timestep) {
     return n;
 }
 
+static void ifblock_free(IFBlock* B) {
+    free(B->w0a); free(B->b0a); free(B->w0b); free(B->b0b);
+    for (int i = 0; i < 8; i++) { free(B->res_w[i]); free(B->res_b[i]); free(B->U[i]); }
+    free(B->dw); free(B->db);
+    free(B->a.data); free(B->x.data); free(B->y.data);
+    free(B->gV); free(B->gM);
+    free(B);
+}
+
 static void net_free(Net* n) {
     tensor_free(&n->img0); tensor_free(&n->img1); tensor_free(&n->tmap); tensor_free(&n->out);
     for (int b = 0; b < NBLK; b++) {
         tensor_free(&n->x[b]); tensor_free(&n->tmp[b]); tensor_free(&n->flow[b]);
         if (b < NBLK - 1) tensor_free(&n->up[b]);
         if (b > 0) tensor_free(&n->mask[b]);
+        ifblock_free(n->blk[b]);
     }
+    free(g_hwc);     g_hwc = NULL;     g_hwc_size = 0;                    /* workspaces shared by the blocks */
+    free(g_wino_ws); g_wino_ws = NULL; g_wino_ws_per_thread = 0;
     free(n);
 }
 
@@ -1600,7 +1617,8 @@ static Tensor load_image_rgb(const char* path, int* w, int* h) {
     for (int y = 0; y < *h; y++) {
         for (int x = 0; x < *w; x++) {
             for (int ch = 0; ch < 3; ch++) {
-                t.data[(size_t)(ch * *h + y) * *w + x] = data[(y * *w + x) * 3 + ch] / 255.0f;
+                // NOLINTNEXTLINE(clang-analyzer-security.ArrayBound) data is the stbi_load buffer of w*h*3 bytes
+                t.data[(size_t)(ch * *h + y) * *w + x] = data[((size_t)y * *w + x) * 3 + ch] / 255.0f;
             }
         }
     }
@@ -1617,7 +1635,7 @@ static void save_image_rgb(const char* path, const Tensor* t) {
             for (int ch = 0; ch < 3; ch++) {
                 float v = t->data[(size_t)(ch * h + y) * w + x] * 255.0f;
                 int iv = (int)roundf(v);
-                buf[(y * w + x) * 3 + ch] = (unsigned char)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
+                buf[((size_t)y * w + x) * 3 + ch] = (unsigned char)(iv < 0 ? 0 : iv > 255 ? 255 : iv);
             }
         }
     }
