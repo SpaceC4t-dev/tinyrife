@@ -9,6 +9,13 @@ gcc -O3 -march=native -fopenmp rife_v46.c -o rife_v46 -lm
 ./rife_v46 [--pad 32|64] flownet-v46.bin frame0.png frame1.png 0.5 out.png [iterations]
 ```
 
+## Structure
+
+The network is hardcoded, not interpreted from the ncnn `.param`: `net_forward()` in `rife_v46.c` is the whole
+pipeline (4 IFBlocks at 1/8, 1/4, 1/2, 1/1 scale accumulating flow and mask, then a fused warp+blend), and is the place
+to start reading. `flownet-v46.bin` is read straight into the kernel layouts and checked against the architecture
+(truncated or wrong-model files are rejected). `RIFE_PROFILE=1` prints a per-phase time breakdown.
+
 ## Benchmark vs. PyTorch
 
 Reference: Practical-RIFE v4.6 graph in stock PyTorch ops (`ref_torch.py` in the repo root, same weights),
