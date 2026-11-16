@@ -1,12 +1,11 @@
-/* 2x frame interpolation of a PNG sequence with the OpenGL RIFE 4.6 (host library: gl_host.c).
+/* 2x frame interpolation of a PNG sequence (build/gl_dir on the GPU, build/cpu_dir on the CPU; see rife.h).
  *
- * Build:  make build/gl_dir
  * Usage:  build/gl_dir [-m model_dir] [-j writer_threads] in_dir out_dir
  * Output: in[0], mid(0,1), in[1], mid(1,2), ..., in[N-1]  ->  2N-1 frames, numbered %08d.png from 1.
  *         The input frames are copied byte for byte; the in-between frames are written with fast PNG compression.
  *
- * Each frame is decoded once and uploaded once; a reader thread decodes ahead and a pool of writer threads encodes and
- * copies behind, so PNG I/O overlaps the GPU. All GL calls stay on the main thread.
+ * Each frame is decoded once and converted once; a reader thread decodes ahead and a pool of writer threads encodes and
+ * copies behind, so PNG I/O overlaps the interpolation. All rife_*() calls stay on the main thread.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -22,18 +21,13 @@
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image.h"
 #include "stb_image_write.h"
-#include "gl_host.h"
+#include "rife.h"
 #include "util.h"
 
-#define AHEAD 4            /* frames decoded ahead of the GPU */
+#define AHEAD 4            /* frames decoded ahead of the interpolation */
 #define DEFAULT_WRITERS 4
 
 /* ------------------------------------------------------------------ reader: decode frames in order */
-
-typedef struct {
-  uint8_t *rgb;   /* NULL on failure */
-  char *err;
-} Frame;
 
 typedef struct {
   char **paths;
@@ -41,24 +35,22 @@ typedef struct {
   Queue *q;
 } ReaderArgs;
 
+/* Queues the decoded frames (RGB24) in order; on a bad frame it records the error and stops. */
 static void *reader_main(void *p) {
   ReaderArgs *a = p;
   for (int i = 0; i < a->n; i++) {
-    Frame *f = calloc(1, sizeof *f);
-    if (!f) rife_die("out of memory");
     int w, h, c;
-    uint8_t *d = stbi_load(a->paths[i], &w, &h, &c, 3);
-    if (!d) {
-      f->err = fmt_alloc("cannot read %s: %s", a->paths[i], stbi_failure_reason());
-    } else if (w != a->w || h != a->h) {
-      f->err = fmt_alloc("size mismatch at %s: %dx%d, expected %dx%d", a->paths[i], w, h, a->w, a->h);
-      stbi_image_free(d);
-    } else {
-      f->rgb = d;
+    uint8_t *rgb = stbi_load(a->paths[i], &w, &h, &c, 3);
+    if (!rgb) {
+      set_error(fmt_alloc("cannot read %s: %s", a->paths[i], stbi_failure_reason()));
+      break;
     }
-    int failed = f->err != NULL;   /* read before the hand-off: the consumer frees f as soon as it pops it */
-    q_push(a->q, f);
-    if (failed) break;
+    if (w != a->w || h != a->h) {
+      set_error(fmt_alloc("size mismatch at %s: %dx%d, expected %dx%d", a->paths[i], w, h, a->w, a->h));
+      stbi_image_free(rgb);
+      break;
+    }
+    q_push(a->q, rgb);
   }
   q_close(a->q);
   return NULL;
@@ -161,6 +153,8 @@ static void mkdirs(const char *path) {
   free(p);
 }
 
+static char *out_name(const char *out_dir, int k) { return fmt_alloc("%s/%08d.png", out_dir, k + 1); }
+
 /* ------------------------------------------------------------------ main */
 
 int main(int argc, char **argv) {
@@ -186,10 +180,9 @@ int main(int argc, char **argv) {
   mkdirs(out_dir);
   stbi_write_png_compression_level = 1;   /* the in-between frames are a stream, not an archive */
 
-  gl_init();
-  fprintf(stderr, "GL renderer: %s\n", gl_renderer());
   Rife *r = rife_new(h, w, model);
-  size_t nbytes = rife_frame_bytes(r);
+  fprintf(stderr, "backend: %s\n", rife_backend(r));
+  size_t nbytes = (size_t)h * w * 3;
 
   Queue q_in, q_out;
   q_init(&q_in, AHEAD);
@@ -202,39 +195,29 @@ int main(int argc, char **argv) {
   for (int i = 0; i < writers; i++)
     if (pthread_create(&pool[i], NULL, writer_main, &wa) != 0) rife_die("cannot start a writer thread");
 
-#define OUT_NAME(k) fmt_alloc("%s/%08d.png", out_dir, (k) + 1)
-#define NEXT_FRAME(f)                                                                                                  \
-  do {                                                                                                                 \
-    (f) = q_pop(&q_in);                                                                                                \
-    if (!(f)) rife_die("frame reader stopped early");                                                                  \
-    if ((f)->err) rife_die("%s", (f)->err);                                                                            \
-  } while (0)
-
-  double t0 = now_s(), gpu_s = 0;
-  Frame *f;
-  NEXT_FRAME(f);
-  rife_push(r, f->rgb);
-  stbi_image_free(f->rgb); free(f);
-  for (int i = 0; i < n - 1; i++) {
-    submit(&q_out, fmt_alloc("%s", src[i]), OUT_NAME(2 * i), NULL);
-    NEXT_FRAME(f);
-    double tg = now_s();
-    rife_push(r, f->rgb);                       /* each frame is uploaded once and reused for the next pair */
-    stbi_image_free(f->rgb); free(f);
-    uint8_t *mid = malloc(nbytes);
-    if (!mid) rife_die("out of memory");
-    rife_interpolate(r, 0.5f, mid);
-    gpu_s += now_s() - tg;
-    submit(&q_out, NULL, OUT_NAME(2 * i + 1), mid);
+  double t0 = now_s(), rife_s = 0;
+  for (int i = 0; i < n; i++) {   /* output frame 2i is input i, 2i-1 is the frame between inputs i-1 and i */
+    uint8_t *rgb = q_pop(&q_in);
     char *err = get_error();
     if (err) rife_die("%s", err);
-    if ((i + 1) % 50 == 0) {
+    if (!rgb) rife_die("frame reader stopped early");
+    double tg = now_s();
+    rife_push(r, rgb);              /* each frame is converted once and reused for the next pair */
+    stbi_image_free(rgb);
+    if (i > 0) {
+      uint8_t *mid = malloc(nbytes);
+      if (!mid) rife_die("out of memory");
+      rife_interpolate(r, 0.5f, mid);
+      rife_s += now_s() - tg;
+      submit(&q_out, NULL, out_name(out_dir, 2 * i - 1), mid);
+    }
+    submit(&q_out, fmt_alloc("%s", src[i]), out_name(out_dir, 2 * i), NULL);
+    if (i > 0 && i % 50 == 0) {
       double el = now_s() - t0;
-      printf("  %d/%d interpolated, %.1fs elapsed, %.2f interp/s\n", i + 1, n - 1, el, (i + 1) / el);
+      printf("  %d/%d interpolated, %.1fs elapsed, %.2f interp/s\n", i, n - 1, el, i / el);
       fflush(stdout);
     }
   }
-  submit(&q_out, fmt_alloc("%s", src[n - 1]), OUT_NAME(2 * (n - 1)), NULL);
   q_close(&q_out);
   for (int i = 0; i < writers; i++) pthread_join(pool[i], NULL);
   pthread_join(reader, NULL);
@@ -242,14 +225,13 @@ int main(int argc, char **argv) {
   if (err) rife_die("%s", err);
 
   double el = now_s() - t0;
-  printf("done: %d -> %d frames (%dx%d) in %.1fs | %.2f interp/s overall, RIFE calls %.0f ms avg (upload+GPU+download)\n",
-         n, 2 * n - 1, w, h, el, (n - 1) / el, gpu_s / (n - 1) * 1e3);
+  printf("done: %d -> %d frames (%dx%d) in %.1fs | %.2f interp/s overall, RIFE calls %.0f ms avg (push + interpolate)\n",
+         n, 2 * n - 1, w, h, el, (n - 1) / el, rife_s / (n - 1) * 1e3);
 
   q_destroy(&q_in);
   q_destroy(&q_out);
   free(pool);
   rife_free(r);
-  gl_shutdown();
   for (int i = 0; i < n; i++) free(src[i]);
   free((void *)src);
   free(out_dir);

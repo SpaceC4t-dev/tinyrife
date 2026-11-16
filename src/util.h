@@ -1,17 +1,14 @@
-/* Small helpers shared by the sequence tools (gl_dir, gl_video): monotonic clock, formatted allocation, a bounded
+/* Small helpers shared by the sequence tools (dir, video): monotonic clock, formatted allocation, a bounded
  * blocking queue for handing work between threads, and a holder for the first error any worker thread hits.
  * Header-only and static: each program is a single translation unit. */
 #ifndef UTIL_H
 #define UTIL_H
 
 #include <pthread.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
-#include "gl_host.h"   /* rife_die */
+#include "rife.h"   /* rife_die */
 
 static inline double now_s(void) {
   struct timespec ts;

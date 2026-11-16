@@ -1,17 +1,15 @@
-/* Video -> video frame interpolation with the OpenGL RIFE 4.6 (host library: gl_host.c), piping raw RGB24 through ffmpeg
- * (no intermediate files).
+/* Video -> video frame interpolation, piping raw RGB24 through ffmpeg with no intermediate files (build/gl_video on the
+ * GPU, build/cpu_video on the CPU; see rife.h).
  *
- * Build:  make build/gl_video
  * Usage:  build/gl_video [-m model_dir] [-x multiplier] [-t seconds] [--vcodec "libsvtav1 -preset 8 -crf 28"] in out
  *
  * The output has x times the frame rate: each source frame is followed by x-1 interpolated frames (the last frame is
  * repeated x times). -t only processes the first N seconds. Audio is copied when present. Needs ffmpeg and ffprobe on
  * PATH (or named by the FFMPEG / FFPROBE environment variables).
  *
- * A reader thread feeds decoded frames, a writer thread feeds the encoder, and all GL calls stay on the main thread.
+ * A reader thread feeds decoded frames, a writer thread feeds the encoder, and all rife_*() calls stay on the main thread.
  */
-// NOLINTNEXTLINE(cert-dcl51-cpp) the standard feature-test macro, needed for pipe2 and F_SETPIPE_SZ
-#define _GNU_SOURCE
+#define _GNU_SOURCE   /* pipe2, F_SETPIPE_SZ */
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -22,7 +20,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include "gl_host.h"
+#include "rife.h"
 #include "util.h"
 
 #define QUEUE_FRAMES 8
@@ -38,8 +36,6 @@ typedef struct {
 enum { CHILD_STDOUT, CHILD_STDIN };
 
 /* Run argv with its stdout (CHILD_STDOUT) or stdin (CHILD_STDIN) connected to a pipe. */
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wanalyzer-fd-leak" /* the dup2() result is the stdin/stdout of the program exec'd below */
 static Proc spawn(char *const argv[], int which) {
   int p[2];
   if (pipe2(p, O_CLOEXEC) != 0) rife_die("pipe: %s", strerror(errno));
@@ -49,7 +45,6 @@ static Proc spawn(char *const argv[], int which) {
     /* dup2 clears close-on-exec on the new descriptor; every other pipe end closes at exec */
     if (dup2(which == CHILD_STDOUT ? p[1] : p[0], which == CHILD_STDOUT ? 1 : 0) < 0) _exit(127);
     /* no shell is involved: file names and codec options reach ffmpeg as separate arguments, which is the point of the tool */
-    // NOLINTNEXTLINE(clang-analyzer-optin.taint.GenericTaint)
     execvp(argv[0], argv);
     fprintf(stderr, "cannot run %s: %s\n", argv[0], strerror(errno));
     _exit(127);
@@ -59,7 +54,6 @@ static Proc spawn(char *const argv[], int which) {
   fcntl(proc.fd, F_SETPIPE_SZ, PIPE_BYTES);   /* bigger pipe, fewer wake-ups; fine if refused */
   return proc;
 }
-#pragma GCC diagnostic pop
 
 /* Wait for the child; its exit status, or 128 + signal. */
 static int finish(Proc p) {
@@ -232,9 +226,8 @@ int main(int argc, char **argv) {
   enc_argv[e++] = "-pix_fmt"; enc_argv[e++] = "yuv420p"; enc_argv[e++] = (char *)pos[1];
   enc_argv[e] = NULL;
 
-  gl_init();
-  fprintf(stderr, "GL renderer: %s\n", gl_renderer());
   Rife *r = rife_new(h, w, model);
+  fprintf(stderr, "backend: %s\n", rife_backend(r));
 
   Proc dec = spawn(dec_argv, CHILD_STDOUT), enc = spawn(enc_argv, CHILD_STDIN);
   Queue q_in, q_out;
@@ -246,7 +239,7 @@ int main(int argc, char **argv) {
   if (pthread_create(&reader, NULL, reader_main, &ra) != 0 || pthread_create(&writer, NULL, writer_main, &wa) != 0)
     rife_die("cannot start the I/O threads");
 
-  double t0 = now_s(), gpu_s = 0;
+  double t0 = now_s(), rife_s = 0;
   long n_in = 0, n_interp = 0;
   uint8_t *prev = NULL, *frame;
   while ((frame = q_pop(&q_in)) != NULL) {
@@ -259,7 +252,7 @@ int main(int argc, char **argv) {
         if (!mid) rife_die("out of memory");
         double tg = now_s();
         rife_interpolate(r, (float)((double)k / mult), mid);
-        gpu_s += now_s() - tg;
+        rife_s += now_s() - tg;
         q_push(&q_out, mid);
         n_interp++;
       }
@@ -294,7 +287,7 @@ int main(int argc, char **argv) {
   double el = now_s() - t0;
   printf("done: %ld -> %ld frames (%dx%d, %g -> %g fps) in %.1fs | %.2f interp/s overall, %.0f ms per interpolation\n",
          n_in, n_in * mult, w, h, (double)num / den, (double)(num * mult) / den, el, n_interp / el,
-         gpu_s / (n_interp > 0 ? (double)n_interp : 1.0) * 1e3);
+         rife_s / (n_interp > 0 ? (double)n_interp : 1.0) * 1e3);
   if (dec_rc != 0) fprintf(stderr, "warning: the decoder exited with status %d; the output may be cut short\n", dec_rc);
   if (enc_rc != 0) rife_die("the encoder failed (ffmpeg exit status %d; see its message above)", enc_rc);
 
@@ -302,6 +295,5 @@ int main(int argc, char **argv) {
   q_destroy(&q_out);
   free(codec);
   rife_free(r);
-  gl_shutdown();
   return 0;
 }

@@ -22,7 +22,7 @@ happens at full resolution.
 
 - Scale list becomes `[8, 4, 2, 1] / scale`, plus a downscale of the inputs and an upscale of flow/mask before `final`.
 - 4K on this iGPU: ~1 s/frame at scale 1 vs ~0.25-0.3 s at scale 0.5 (estimate). Also more robust to very large motion.
-- Validate against `ref_torch.py` extended with the same scale logic.
+- Validate against `python/ref_torch.py` extended with the same scale logic.
 
 ## 3. Shader tuning (speed, medium)
 
@@ -35,7 +35,7 @@ Expected total: roughly 111 -> 100 ms at 720p.
 - **conv0a** (12 input channels, 37% of peak): load-bound; increase pixels per thread for this shape only.
 - **fuse `update` into the next block's `prep`**: saves a full-res read/write per block; a few ms.
 
-Method: `bench_gl.py --breakdown` for per-dispatch GPU time, convert to % of peak
+Method: `RIFE_PROFILE=1 build/gl -b N` for GPU time per stage, convert to % of peak
 (6 CU x 64 x 2 x 1.5 GHz = 1.15 TFLOP/s), and check `MESA_SHADER_CACHE_DISABLE=true AMD_DEBUG=cs,stats,asm` for
 VGPRs / waves / spills / instruction mix. Lock clocks
 (`echo high > /sys/class/drm/card1/device/power_dpm_force_performance_level`) for stable numbers.
@@ -44,7 +44,7 @@ VGPRs / waves / spills / instruction mix. Lock clocks
 
 GL 4.3 core + fp32 was chosen for compatibility but has only been verified on one AMD GPU.
 
-- Run `test_gl.py` and `bench_gl.py` on Intel and NVIDIA (Linux and Windows).
+- Run `make test` and `build/gl -b` on Intel and NVIDIA (Linux and Windows).
 - OpenGL ES 3.1 variant (same GLSL plus precision qualifiers) for Raspberry Pi 5 / Android.
 
 ## 5. Newer RIFE models (larger)
@@ -54,7 +54,6 @@ RIFE 4.7-4.26 add a small feature encoder and wider blocks; noticeably better on
 - Same layer types (3x3 conv, LeakyReLU, deconv + PixelShuffle, warp), so the shaders mostly carry over.
 - Needs a weight loader for those models and an updated reference.
 
-## 6. Packaging / integration (larger)
+## 6. Integration (larger)
 
-- pip package with a CLI entry point.
-- Thin C/Rust host (~300 lines, same GLSL) for a VapourSynth plugin or an ffmpeg filter, no Python dependency.
+- VapourSynth plugin or ffmpeg filter on top of `rife.h`.
